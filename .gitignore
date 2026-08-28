@@ -1,0 +1,85 @@
+# ========================
+# Go build artifacts
+# ========================
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+bin/
+dist/
+build/
+
+# Go workspace
+go.work
+go.work.sum
+
+# Go local build cache
+.go-cache/
+.go-tmp/
+
+# ========================
+# Go modules cache (optional)
+# ========================
+vendor/
+
+# ========================
+# Environment files (IMPORTANT)
+# ========================
+.env
+.env.*
+!.env.example
+
+# ========================
+# Exports (generated Excel files)
+# ========================
+exports/
+
+# ========================
+# Logs
+# ========================
+*.log
+logs/
+tmp/
+*.tmp
+
+# ========================
+# OS files
+# ========================
+.DS_Store
+Thumbs.db
+
+# ========================
+# IDE / Editors
+# ========================
+
+# VS Code
+.vscode/
+
+# GoLand / IntelliJ
+.idea/
+
+# Vim
+*.swp
+*.swo
+
+# ========================
+# Test coverage
+# ========================
+coverage.out
+coverage.html
+
+# ========================
+# Debug / profiling
+# ========================
+*.prof
+*.pprof
+
+# ========================
+# Docker (if later added)
+# ========================
+docker-data/
+login.html
+cashfree_test.html

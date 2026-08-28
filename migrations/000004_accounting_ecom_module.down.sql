@@ -1,0 +1,13 @@
+DROP TABLE IF EXISTS ecom_order_items CASCADE;
+DROP TABLE IF EXISTS ecom_orders CASCADE;
+DROP TABLE IF EXISTS ecom_cart_items CASCADE;
+DROP TABLE IF EXISTS ecom_carts CASCADE;
+DROP TABLE IF EXISTS ecom_addresses CASCADE;
+DROP TABLE IF EXISTS ecom_customers CASCADE;
+DROP SEQUENCE IF EXISTS ecom_order_seq;
+
+DROP TABLE IF EXISTS voucher_lines;
+DROP TABLE IF EXISTS vouchers;
+DROP TABLE IF EXISTS financial_years;
+DROP TABLE IF EXISTS ledger_accounts;
+DROP TABLE IF EXISTS account_groups;

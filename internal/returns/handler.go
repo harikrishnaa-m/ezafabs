@@ -1,0 +1,119 @@
+package returns
+
+import (
+	"database/sql"
+	"log"
+	"net/http"
+
+	"defab-erp/internal/accounting"
+	"defab-erp/internal/core/httperr"
+	"defab-erp/internal/core/model"
+
+	"github.com/gofiber/fiber/v2"
+)
+
+type Handler struct {
+	store    *Store
+	recorder *accounting.Recorder
+}
+
+func NewHandler(s *Store, r *accounting.Recorder) *Handler {
+	return &Handler{store: s, recorder: r}
+}
+
+func (h *Handler) Create(c *fiber.Ctx) error {
+	var in CreateReturnOrderInput
+	if err := c.BodyParser(&in); err != nil {
+		return httperr.BadRequest(c, "Invalid JSON body")
+	}
+	if in.SalesInvoiceID == "" || len(in.Items) == 0 {
+		return httperr.BadRequest(c, "sales_invoice_id and items are required")
+	}
+	user := c.Locals("user").(*model.User)
+	id, err := h.store.CreateReturnOrder(in, user.ID.String())
+	if err != nil {
+		log.Println("create return order error:", err)
+		return httperr.Internal(c)
+	}
+	if err := h.recorder.RecordSalesReturn(id, user.ID.String()); err != nil {
+		log.Println("record return voucher error:", err)
+	}
+	return c.Status(http.StatusCreated).JSON(fiber.Map{"return_order_id": id})
+}
+
+// Lookup handles GET /returns/lookup?return_number=RET-001
+// Returns the return total so billing can apply it as a discount.
+func (h *Handler) Lookup(c *fiber.Ctx) error {
+	num := c.Query("return_number")
+	if num == "" {
+		return httperr.BadRequest(c, "return_number query param is required")
+	}
+	result, err := h.store.GetByReturnNumber(num)
+	if err == sql.ErrNoRows {
+		return httperr.NotFound(c, "No return found for this return number")
+	}
+	if err != nil {
+		log.Println("return lookup error:", err)
+		return httperr.Internal(c)
+	}
+	return c.JSON(result)
+}
+
+func (h *Handler) List(c *fiber.Ctx) error {
+	filter := ReturnListFilter{Limit: 0, Offset: 0}
+	if bid := c.Query("branch_id"); bid != "" {
+		filter.BranchID = &bid
+	}
+	filter.Status = c.Query("status")
+	filter.Search = c.Query("search")
+
+	limitStr := c.Query("limit")
+	offsetStr := c.Query("offset")
+	if limitStr != "" || offsetStr != "" {
+		if limit := c.QueryInt("limit"); limit > 0 {
+			filter.Limit = limit
+		} else {
+			filter.Limit = 20
+		}
+		if offset := c.QueryInt("offset"); offset >= 0 {
+			filter.Offset = offset
+		}
+	}
+
+	list, total, err := h.store.List(filter.BranchID, filter.Status, filter.Search, filter.Limit, filter.Offset)
+	if err != nil {
+		log.Println("list return orders error:", err)
+		return httperr.Internal(c)
+	}
+	return c.JSON(fiber.Map{"returns": list, "total": total, "limit": filter.Limit, "offset": filter.Offset})
+}
+
+func (h *Handler) GetByID(c *fiber.Ctx) error {
+	id := c.Params("id")
+	ret, err := h.store.GetByID(id)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return httperr.NotFound(c, "Return order not found")
+		}
+		log.Println("get return order error:", err)
+		return httperr.Internal(c)
+	}
+	return c.JSON(ret)
+}
+
+func (h *Handler) Cancel(c *fiber.Ctx) error {
+	id := c.Params("id")
+	user := c.Locals("user").(*model.User)
+	if err := h.store.CancelReturnOrder(id); err != nil {
+		if err == sql.ErrNoRows {
+			return httperr.NotFound(c, "Return order not found")
+		}
+		log.Println("cancel return order error:", err)
+		return httperr.Internal(c)
+	}
+	if err := h.recorder.CancelVoucherByRef("sales_return", id); err != nil {
+		log.Println("cancel return voucher error:", err)
+	}
+	_ = user // used for audit context
+	return c.JSON(fiber.Map{"message": "Return order cancelled"})
+}

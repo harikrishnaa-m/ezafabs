@@ -1,0 +1,790 @@
+package variant
+
+import (
+	"database/sql"
+	"fmt"
+	"strings"
+	// "github.com/google/uuid"
+)
+
+type Store struct {
+	db *sql.DB
+}
+
+func NewStore(db *sql.DB) *Store {
+	return &Store{db: db}
+}
+
+//
+// ================= CREATE =================
+//
+
+func (s *Store) Create(in CreateVariantInput) (string, string, int, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", "", 0, err
+	}
+	defer tx.Rollback()
+
+	// Auto-generate SKU: first 3 letters of brand + product name + attribute values
+	var brand, productName string
+	err = tx.QueryRow(`SELECT COALESCE(brand,''), name FROM products WHERE id = $1`, in.ProductID).Scan(&brand, &productName)
+	if err != nil {
+		return "", "", 0, fmt.Errorf("product not found: %w", err)
+	}
+
+	sku := strings.ToUpper(first3(brand) + " " + first3(productName))
+
+	// Append first 3 letters of each attribute value
+	for _, avid := range in.AttributeValueIDs {
+		var val string
+		err = tx.QueryRow(`SELECT value FROM attribute_values WHERE id = $1`, avid).Scan(&val)
+		if err == nil {
+			sku += " " + strings.ToUpper(first3(val))
+		}
+	}
+
+	// Ensure uniqueness by appending a number if needed
+	baseSku := sku
+	var exists bool
+	for i := 1; ; i++ {
+		err = tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM variants WHERE sku = $1)`, sku).Scan(&exists)
+		if err != nil {
+			return "", "", 0, err
+		}
+		if !exists {
+			break
+		}
+		sku = fmt.Sprintf("%s %d", baseSku, i)
+	}
+
+	var id string
+	var variantCode int
+
+	if in.VariantCode != nil {
+		err = tx.QueryRow(`
+		INSERT INTO variants
+		(product_id,name,sku,price,cost_price,barcode,variant_code,hsn_code)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		RETURNING id, variant_code
+		`,
+			in.ProductID,
+			in.Name,
+			sku,
+			in.Price,
+			in.CostPrice,
+			sku,
+			*in.VariantCode,
+			in.HSNCode,
+		).Scan(&id, &variantCode)
+	} else {
+		err = tx.QueryRow(`
+		INSERT INTO variants
+		(product_id,name,sku,price,cost_price,barcode,hsn_code)
+		VALUES ($1,$2,$3,$4,$5,$6,$7)
+		RETURNING id, variant_code
+		`,
+			in.ProductID,
+			in.Name,
+			sku,
+			in.Price,
+			in.CostPrice,
+			sku,
+			in.HSNCode,
+		).Scan(&id, &variantCode)
+	}
+
+	if err != nil {
+		return "", "", 0, err
+	}
+
+	for _, avid := range in.AttributeValueIDs {
+		_, err := tx.Exec(`
+			INSERT INTO variant_attribute_mapping
+			(variant_id, attribute_value_id)
+			VALUES ($1,$2)
+		`, id, avid)
+		if err != nil {
+			return "", "", 0, err
+		}
+	}
+
+	// Save images
+	for _, imgPath := range in.ImagePaths {
+		_, err := tx.Exec(`
+			INSERT INTO variant_images
+			(variant_id, image_url)
+			VALUES ($1,$2)
+		`, id, imgPath)
+		if err != nil {
+			return "", "", 0, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return "", "", 0, err
+	}
+	return id, sku, variantCode, nil
+}
+
+// first3 returns the first 3 letters of a string (uppercase, no spaces)
+func first3(s string) string {
+	s = strings.ReplaceAll(s, " ", "")
+	if len(s) >= 3 {
+		return s[:3]
+	}
+	return s
+}
+
+//
+// ================= LIST =================
+//
+
+func (s *Store) ListByProduct(pid string) (*sql.Rows, error) {
+	return s.db.Query(`
+	SELECT id,variant_code,name,sku,price,cost_price,is_active,COALESCE(hsn_code,'')
+	FROM variants
+	WHERE product_id=$1
+	ORDER BY variant_code
+	`, pid)
+}
+
+//
+// ================= GET =================
+//
+
+func (s *Store) Get(id string) (*sql.Row, error) {
+	return s.db.QueryRow(`
+	SELECT v.id, v.product_id, v.variant_code, v.name, v.sku, COALESCE(v.barcode,''), v.price, v.cost_price, v.is_active, COALESCE(v.hsn_code,''),
+	       COALESCE(p.name, ''), COALESCE(p.uom, ''), COALESCE(p.category_id::text, ''), COALESCE(cat.name, ''), COALESCE(p.description, '')
+	FROM variants v
+	LEFT JOIN products p ON p.id = v.product_id
+	LEFT JOIN categories cat ON cat.id = p.category_id
+	WHERE v.id=$1
+	`, id), nil
+}
+
+func (s *Store) GetVariantAttributes(variantID string) ([]map[string]string, error) {
+	rows, err := s.db.Query(`
+		SELECT av.id, av.value, a.id, a.name
+		FROM variant_attribute_mapping vam
+		JOIN attribute_values av ON vam.attribute_value_id = av.id
+		JOIN attributes a ON av.attribute_id = a.id
+		WHERE vam.variant_id = $1
+	`, variantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []map[string]string
+	for rows.Next() {
+		var avID, avValue, attID, attName string
+		if err := rows.Scan(&avID, &avValue, &attID, &attName); err != nil {
+			return nil, err
+		}
+		out = append(out, map[string]string{
+			"attribute_id":   attID,
+			"attribute_name": attName,
+			"value_id":       avID,
+			"value_name":     avValue,
+		})
+	}
+	return out, nil
+}
+
+//
+// ================= UPDATE =================
+//
+
+func (s *Store) Update(id string, in UpdateVariantInput) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(`
+	UPDATE variants SET
+	name = COALESCE($1,name),
+	price = COALESCE($2,price),
+	cost_price = COALESCE($3,cost_price),
+	variant_code = COALESCE($4,variant_code)
+	WHERE id=$5
+	`,
+		in.Name,
+		in.Price,
+		in.CostPrice,
+		in.VariantCode,
+		id,
+	)
+	if err != nil {
+		return err
+	}
+
+	if len(in.AttributeValueIDs) > 0 {
+		_, err = tx.Exec(`DELETE FROM variant_attribute_mapping WHERE variant_id=$1`, id)
+		if err != nil {
+			return err
+		}
+		for _, avid := range in.AttributeValueIDs {
+			_, err = tx.Exec(`INSERT INTO variant_attribute_mapping (variant_id, attribute_value_id) VALUES ($1,$2)`, id, avid)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return tx.Commit()
+}
+
+//
+// ================= SOFT DELETE =================
+//
+
+func (s *Store) SetActive(id string, active bool) error {
+	_, err := s.db.Exec(
+		`UPDATE variants SET is_active=$1 WHERE id=$2`,
+		active, id,
+	)
+	return err
+}
+
+//
+// ================= ATTRIBUTE LOOKUP =================
+//
+
+func (s *Store) GetAttributeValues(ids []string) (map[string]string, error) {
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("no attribute value IDs provided")
+	}
+	query := fmt.Sprintf(`SELECT id, value FROM attribute_values WHERE id IN (%s)`, placeholders(len(ids)))
+	args := make([]interface{}, len(ids))
+	for i, v := range ids {
+		args[i] = v
+	}
+	// Debug: print query and args
+	fmt.Printf("GetAttributeValues query: %s\n", query)
+	fmt.Printf("GetAttributeValues args: %v\n", args)
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("attribute_values query error: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var id, val string
+		if err := rows.Scan(&id, &val); err != nil {
+			return nil, fmt.Errorf("attribute_values scan error: %w", err)
+		}
+		out[id] = val
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no attribute values found for provided IDs")
+	}
+	return out, nil
+}
+
+//
+// ================= GENERATOR =================
+//
+
+// GenerateWithAttrOrder generates variants using attribute IDs and value IDs
+func (s *Store) GenerateWithAttrOrder(productID string, basePrice float64, attrOrder []string, groups [][]string) ([]string, error) {
+	combinations := cartesian(groups)
+
+	valMap, err := s.GetAttributeValues(flatten(groups))
+	if err != nil {
+		fmt.Printf("GenerateWithAttrOrder: GetAttributeValues error: %v\n", err)
+		return nil, err
+	}
+
+	var created []string
+
+	fmt.Printf("GenerateWithAttrOrder: combinations = %v\n", combinations)
+	for _, combo := range combinations {
+		nameParts := []string{}
+		for _, id := range combo {
+			nameParts = append(nameParts, valMap[id])
+		}
+		name := strings.Join(nameParts, " ")
+
+		fmt.Printf("GenerateWithAttrOrder: Creating variant: name=%s, combo=%v\n", name, combo)
+		id, sku, _, err := s.Create(CreateVariantInput{
+			ProductID:         productID,
+			Name:              name,
+			Price:             basePrice,
+			AttributeValueIDs: combo,
+		})
+		if err != nil {
+			fmt.Printf("GenerateWithAttrOrder: Create error: %v\n", err)
+		} else {
+			fmt.Printf("GenerateWithAttrOrder: Created variant id=%s, sku=%s\n", id, sku)
+			created = append(created, id)
+		}
+	}
+	return created, nil
+}
+
+//
+//
+// ================= BACKFILL VARIANT CODES =================
+//
+
+func (s *Store) BackfillVariantCodes() (int, error) {
+	res, err := s.db.Exec(`
+		UPDATE variants
+		SET variant_code = nextval('variant_code_seq')
+		WHERE variant_code IS NULL OR variant_code = 0
+	`)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+//
+// ================= LOOKUP BY CODE =================
+//
+
+func (s *Store) GetByCode(code string) (map[string]interface{}, error) {
+	var (
+		variantID, variantName, sku, barcode       string
+		productID, productName, productDesc, brand string
+		categoryID, categoryName                   string
+		mainImage, uom, fabricComposition          string
+		pattern, occasion, careInstructions        string
+		variantCode                                int
+		price, costPrice                           float64
+		isActive, isStitched                       bool
+	)
+	err := s.db.QueryRow(`
+		SELECT
+			v.id, v.variant_code, v.name, v.sku,
+			COALESCE(v.barcode,''), v.price, COALESCE(v.cost_price,0), v.is_active,
+			p.id, p.name, COALESCE(p.description,''), COALESCE(p.brand,''),
+			COALESCE(p.main_image_url,''), COALESCE(p.uom,''), COALESCE(p.fabric_composition,''),
+			COALESCE(p.pattern,''), COALESCE(p.occasion,''), COALESCE(p.care_instructions,''),
+			p.is_stitched,
+			COALESCE(c.id::text,''), COALESCE(c.name,'')
+		FROM variants v
+		JOIN products p ON p.id = v.product_id
+		LEFT JOIN categories c ON c.id = p.category_id
+		WHERE v.variant_code::text = $1
+		LIMIT 1
+	`, code).Scan(
+		&variantID, &variantCode, &variantName, &sku,
+		&barcode, &price, &costPrice, &isActive,
+		&productID, &productName, &productDesc, &brand,
+		&mainImage, &uom, &fabricComposition,
+		&pattern, &occasion, &careInstructions,
+		&isStitched,
+		&categoryID, &categoryName,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	attributes, err := s.GetVariantAttributes(variantID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Current stock across all warehouses
+	stockRows, err := s.db.Query(`
+		SELECT s.warehouse_id, w.name, s.quantity
+		FROM stocks s
+		JOIN warehouses w ON w.id = s.warehouse_id
+		WHERE s.variant_id = $1
+	`, variantID)
+	if err != nil {
+		return nil, err
+	}
+	defer stockRows.Close()
+	var stocks []map[string]interface{}
+	for stockRows.Next() {
+		var whID, whName string
+		var qty float64
+		if err := stockRows.Scan(&whID, &whName, &qty); err != nil {
+			return nil, err
+		}
+		stocks = append(stocks, map[string]interface{}{
+			"warehouse_id":   whID,
+			"warehouse_name": whName,
+			"quantity":       qty,
+		})
+	}
+
+	return map[string]interface{}{
+		"id":           variantID,
+		"variant_code": variantCode,
+		"name":         variantName,
+		"sku":          sku,
+		"barcode":      barcode,
+		"price":        price,
+		"cost_price":   costPrice,
+		"is_active":    isActive,
+		"product": map[string]interface{}{
+			"id":                 productID,
+			"name":               productName,
+			"description":        productDesc,
+			"brand":              brand,
+			"main_image_url":     mainImage,
+			"uom":                uom,
+			"fabric_composition": fabricComposition,
+			"pattern":            pattern,
+			"occasion":           occasion,
+			"care_instructions":  careInstructions,
+			"is_stitched":        isStitched,
+		},
+		"category": map[string]interface{}{
+			"id":   categoryID,
+			"name": categoryName,
+		},
+		"attributes": attributes,
+		"stocks":     stocks,
+	}, nil
+}
+
+//
+// ================= SEARCH =================
+//
+
+func (s *Store) Search(query, warehouseID string) ([]map[string]interface{}, error) {
+	q := "%" + strings.ToLower(query) + "%"
+
+	rows, err := s.db.Query(`
+		SELECT v.id, v.variant_code, v.name, v.sku, COALESCE(v.barcode, ''),
+		       v.price, v.cost_price,
+		       v.is_active, p.id AS product_id, p.name AS product_name,
+		       COALESCE(SUM(st.quantity), 0) AS stock_quantity
+		FROM variants v
+		JOIN products p ON p.id = v.product_id
+		LEFT JOIN stocks st ON st.variant_id = v.id AND ($2 = '' OR st.warehouse_id::text = $2)
+		WHERE v.is_active = true
+		  AND (
+		      LOWER(v.sku) LIKE $1
+		   OR LOWER(v.name) LIKE $1
+		   OR LOWER(p.name) LIKE $1
+		   OR CAST(v.variant_code AS TEXT) LIKE $1
+		  )
+		GROUP BY v.id, v.variant_code, v.name, v.sku, v.barcode, v.price, v.cost_price, v.is_active, p.id, p.name
+		ORDER BY v.variant_code
+		LIMIT 50
+	`, q, warehouseID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []map[string]interface{}
+	for rows.Next() {
+		var id, name, sku, barcode, productID, productName string
+		var variantCode int
+		var price, costPrice, stockQty float64
+		var isActive bool
+		if err := rows.Scan(&id, &variantCode, &name, &sku, &barcode, &price, &costPrice, &isActive, &productID, &productName, &stockQty); err != nil {
+			return nil, err
+		}
+		out = append(out, map[string]interface{}{
+			"id":             id,
+			"variant_code":   variantCode,
+			"name":           name,
+			"sku":            sku,
+			"barcode":        barcode,
+			"price":          price,
+			"cost_price":     costPrice,
+			"is_active":      isActive,
+			"product_id":     productID,
+			"product_name":   productName,
+			"stock_quantity": stockQty,
+		})
+	}
+	return out, nil
+}
+
+//
+// ================= HELPERS =================
+//
+
+func placeholders(n int) string {
+	p := make([]string, n)
+	for i := range p {
+		p[i] = fmt.Sprintf("$%d", i+1)
+	}
+	return strings.Join(p, ",")
+}
+
+func flatten(g [][]string) []string {
+	var out []string
+	for _, a := range g {
+		out = append(out, a...)
+	}
+	return out
+}
+
+func cartesian(groups [][]string) [][]string {
+	if len(groups) == 0 {
+		return [][]string{}
+	}
+
+	result := [][]string{{}}
+
+	for _, group := range groups {
+		var next [][]string
+		for _, r := range result {
+			for _, g := range group {
+				n := append([]string{}, r...)
+				n = append(n, g)
+				next = append(next, n)
+			}
+		}
+		result = next
+	}
+	return result
+}
+
+// ItemMaster returns variants with stock info.
+// warehouseID = "" → SuperAdmin: one flat row per variant per warehouse.
+// warehouseID set → StoreManager: only variants with stock in that warehouse.
+// variantCode = "" → no filter; set to search by variant code prefix.
+// limit = 0 → no pagination, return everything.
+func (s *Store) ItemMaster(warehouseID, variantCode string, limit, offset int) ([]map[string]interface{}, int, error) {
+	var total int
+	var countQ string
+	var countArgs []interface{}
+
+	if warehouseID != "" {
+		if variantCode != "" {
+			countQ = `
+				SELECT COUNT(DISTINCT v.id)
+				FROM variants v
+				INNER JOIN stocks st ON st.variant_id = v.id AND st.warehouse_id = $1
+				WHERE v.variant_code::text LIKE $2
+			`
+			countArgs = []interface{}{warehouseID, variantCode + "%"}
+		} else {
+			countQ = `
+				SELECT COUNT(DISTINCT v.id)
+				FROM variants v
+				INNER JOIN stocks st ON st.variant_id = v.id AND st.warehouse_id = $1
+			`
+			countArgs = []interface{}{warehouseID}
+		}
+	} else {
+		if variantCode != "" {
+			countQ = `
+				SELECT COUNT(*)
+				FROM variants v
+				JOIN products p ON p.id = v.product_id
+				LEFT JOIN stocks st ON st.variant_id = v.id
+				LEFT JOIN warehouses w ON w.id = st.warehouse_id
+				WHERE v.variant_code::text LIKE $1
+			`
+			countArgs = []interface{}{variantCode + "%"}
+		} else {
+			// count flat rows (one per variant-warehouse pair)
+			countQ = `
+				SELECT COUNT(*)
+				FROM variants v
+				JOIN products p ON p.id = v.product_id
+				LEFT JOIN stocks st ON st.variant_id = v.id
+				LEFT JOIN warehouses w ON w.id = st.warehouse_id
+			`
+		}
+	}
+	if err := s.db.QueryRow(countQ, countArgs...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	var rows *sql.Rows
+	var err error
+
+	if warehouseID != "" {
+		// Store manager: one row per variant, quantity from their warehouse only
+		args := []interface{}{warehouseID}
+		idx := 2
+		wherePart := ""
+		if variantCode != "" {
+			wherePart = fmt.Sprintf(" AND v.variant_code::text LIKE $%d", idx)
+			args = append(args, variantCode+"%")
+			idx++
+		}
+		baseQ := fmt.Sprintf(`
+			SELECT v.id, v.variant_code, v.name, v.sku, COALESCE(v.barcode,''),
+			       v.price, COALESCE(v.cost_price, 0), COALESCE(v.hsn_code,''),
+			       p.id, p.name, COALESCE(c.name,''), v.is_active,
+			       COALESCE(st.quantity, 0),
+			       COALESCE(w.id::text,''), COALESCE(w.name,''), COALESCE(b.name,''),
+			       pi.invoice_number, sup.name, p.description
+			FROM variants v
+			JOIN products p ON p.id = v.product_id
+			LEFT JOIN categories c ON c.id = p.category_id
+			INNER JOIN stocks st ON st.variant_id = v.id AND st.warehouse_id = $1
+			LEFT JOIN warehouses w ON w.id = st.warehouse_id
+			LEFT JOIN branches b ON b.id = w.branch_id
+			LEFT JOIN purchase_order_items poi ON poi.product_code = v.variant_code::text
+			LEFT JOIN purchase_orders po ON po.id = poi.purchase_order_id
+			LEFT JOIN purchase_invoices pi ON pi.purchase_order_id = po.id
+			LEFT JOIN suppliers sup ON sup.id = po.supplier_id
+			WHERE 1=1%s
+			ORDER BY v.variant_code
+		`, wherePart)
+		if limit > 0 {
+			baseQ += fmt.Sprintf(" LIMIT $%d OFFSET $%d", idx, idx+1)
+			args = append(args, limit, offset)
+		}
+		rows, err = s.db.Query(baseQ, args...)
+		if err != nil {
+			return nil, 0, err
+		}
+		defer rows.Close()
+
+		var out []map[string]interface{}
+		for rows.Next() {
+			var id, name, sku, barcode, hsnCode, productID, productName, categoryName string
+			var warehouseID2, warehouseName, branchName string
+			var variantCode int
+			var price, costPrice, qty float64
+			var isActive bool
+			var billNo, supplierName, description sql.NullString
+			if err := rows.Scan(&id, &variantCode, &name, &sku, &barcode,
+				&price, &costPrice, &hsnCode,
+				&productID, &productName, &categoryName, &isActive, &qty,
+				&warehouseID2, &warehouseName, &branchName,
+				&billNo, &supplierName, &description); err != nil {
+				return nil, 0, err
+			}
+			out = append(out, map[string]interface{}{
+				"id":             id,
+				"variant_code":   variantCode,
+				"name":           name,
+				"sku":            sku,
+				"barcode":        barcode,
+				"price":          price,
+				"cost_price":     costPrice,
+				"hsn_code":       hsnCode,
+				"product_id":     productID,
+				"product_name":   productName,
+				"category_name":  categoryName,
+				"is_active":      isActive,
+				"quantity":       qty,
+				"warehouse_id":   warehouseID2,
+				"warehouse_name": warehouseName,
+				"branch_name":    branchName,
+				"bill_no":        nullableString(billNo),
+				"supplier_name":  nullableString(supplierName),
+				"description":    nullableString(description),
+			})
+		}
+		return out, total, nil
+	}
+
+	// Admin: flat rows — one entry per variant per warehouse
+	adminArgs := []interface{}{}
+	idx := 1
+	wherePart := ""
+	if variantCode != "" {
+		wherePart = fmt.Sprintf(" WHERE v.variant_code::text LIKE $%d", idx)
+		adminArgs = append(adminArgs, variantCode+"%")
+		idx++
+	}
+	baseQ := fmt.Sprintf(`
+		SELECT v.id, v.variant_code, v.name, v.sku, COALESCE(v.barcode,''),
+		       v.price, COALESCE(v.cost_price, 0), COALESCE(v.hsn_code,''),
+		       p.id, p.name, COALESCE(c.name,''), v.is_active,
+		       COALESCE(w.id::text,''), COALESCE(w.name,''),
+		       COALESCE(b.name,''), COALESCE(st.quantity, 0),
+		       pi.invoice_number, sup.name, p.description
+		FROM variants v
+		JOIN products p ON p.id = v.product_id
+		LEFT JOIN categories c ON c.id = p.category_id
+		LEFT JOIN stocks st ON st.variant_id = v.id
+		LEFT JOIN warehouses w ON w.id = st.warehouse_id
+		LEFT JOIN branches b ON b.id = w.branch_id
+		LEFT JOIN purchase_order_items poi ON poi.product_code = v.variant_code::text
+		LEFT JOIN purchase_orders po ON po.id = poi.purchase_order_id
+		LEFT JOIN purchase_invoices pi ON pi.purchase_order_id = po.id
+		LEFT JOIN suppliers sup ON sup.id = po.supplier_id
+		%s
+		ORDER BY v.variant_code, w.name
+	`, wherePart)
+	if limit > 0 {
+		baseQ += fmt.Sprintf(" LIMIT $%d OFFSET $%d", idx, idx+1)
+		adminArgs = append(adminArgs, limit, offset)
+	}
+	rows, err = s.db.Query(baseQ, adminArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var out []map[string]interface{}
+	for rows.Next() {
+		var id, name, sku, barcode, hsnCode, productID, productName, categoryName string
+		var warehouseID2, warehouseName, branchName string
+		var variantCode int
+		var price, costPrice, qty float64
+		var isActive bool
+		var billNo, supplierName, description sql.NullString
+		if err := rows.Scan(&id, &variantCode, &name, &sku, &barcode,
+			&price, &costPrice, &hsnCode,
+			&productID, &productName, &categoryName, &isActive,
+			&warehouseID2, &warehouseName, &branchName, &qty,
+			&billNo, &supplierName, &description); err != nil {
+			return nil, 0, err
+		}
+		out = append(out, map[string]interface{}{
+			"id":             id,
+			"variant_code":   variantCode,
+			"name":           name,
+			"sku":            sku,
+			"barcode":        barcode,
+			"price":          price,
+			"cost_price":     costPrice,
+			"hsn_code":       hsnCode,
+			"product_id":     productID,
+			"product_name":   productName,
+			"category_name":  categoryName,
+			"is_active":      isActive,
+			"warehouse_id":   warehouseID2,
+			"warehouse_name": warehouseName,
+			"branch_name":    branchName,
+			"quantity":       qty,
+			"bill_no":        nullableString(billNo),
+			"supplier_name":  nullableString(supplierName),
+			"description":    nullableString(description),
+		})
+	}
+	return out, total, nil
+}
+
+// nullableString returns nil (JSON null) for an invalid/unset sql.NullString.
+func nullableString(ns sql.NullString) interface{} {
+	if !ns.Valid {
+		return nil
+	}
+	return ns.String
+}
+
+func (s *Store) getProductPrefix(productID string) (string, error) {
+	var name string
+	err := s.db.QueryRow(
+		`SELECT name FROM products WHERE id=$1`,
+		productID,
+	).Scan(&name)
+
+	if err != nil {
+		return "", err
+	}
+
+	// simple prefix rule
+	name = strings.ToUpper(name)
+	name = strings.TrimSpace(name)
+	name = strings.ReplaceAll(name, " ", "")
+	name = strings.ReplaceAll(name, "-", "")
+	name = strings.ReplaceAll(name, "_", "")
+
+	return name, nil
+}

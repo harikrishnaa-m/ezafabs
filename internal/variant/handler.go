@@ -1,0 +1,418 @@
+package variant
+
+import (
+	"defab-erp/internal/core/model"
+	"defab-erp/internal/core/storage"
+	"fmt"
+	"strconv"
+
+	"github.com/gofiber/fiber/v2"
+)
+
+type Handler struct {
+	store *Store
+}
+
+func NewHandler(s *Store) *Handler {
+	return &Handler{store: s}
+}
+
+func (h *Handler) Create(c *fiber.Ctx) error {
+
+	productID := c.FormValue("product_id")
+	name := c.FormValue("name")
+
+	priceStr := c.FormValue("price")
+	costPriceStr := c.FormValue("cost_price")
+
+	price, _ := strconv.ParseFloat(priceStr, 64)
+	costPrice, _ := strconv.ParseFloat(costPriceStr, 64)
+
+	var variantCodeInput *int
+	if vcStr := c.FormValue("variant_code"); vcStr != "" {
+		vc, err := strconv.Atoi(vcStr)
+		if err == nil {
+			variantCodeInput = &vc
+		}
+	}
+
+	hsnCode := c.FormValue("hsn_code")
+
+	form, _ := c.MultipartForm()
+	if form == nil {
+		// no multipart form — continue with empty collections
+		in := CreateVariantInput{
+			ProductID:   productID,
+			Name:        name,
+			Price:       price,
+			CostPrice:   costPrice,
+			VariantCode: variantCodeInput,
+			HSNCode:     hsnCode,
+		}
+		id, sku, variantCode, err := h.store.Create(in)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		}
+		return c.Status(201).JSON(fiber.Map{
+			"message":      "variant created",
+			"id":           id,
+			"sku":          sku,
+			"variant_code": variantCode,
+		})
+	}
+
+	attrIDs := form.Value["attribute_value_ids[]"]
+
+	var cleanAttrIDs []string
+	for _, id := range attrIDs {
+		if id != "" {
+			cleanAttrIDs = append(cleanAttrIDs, id)
+		}
+	}
+
+	files := form.File["images"]
+
+	var imagePaths []string
+
+	for _, file := range files {
+
+		data, fname, err := storage.ProcessImage(file)
+		if err != nil {
+			fmt.Println("image processing error:", err)
+			continue
+		}
+
+		url, err := storage.UploadFile(
+			"variants/"+fname,
+			data,
+			file.Header.Get("Content-Type"),
+		)
+		if err != nil {
+			fmt.Println("upload error:", err)
+			continue
+		}
+
+		imagePaths = append(imagePaths, url)
+	}
+
+	fmt.Println("Attribute IDs:", cleanAttrIDs)
+	fmt.Println("Files count:", len(files))
+	fmt.Println("Image paths:", imagePaths)
+
+	in := CreateVariantInput{
+		ProductID:         productID,
+		Name:              name,
+		Price:             price,
+		CostPrice:         costPrice,
+		VariantCode:       variantCodeInput,
+		HSNCode:           hsnCode,
+		AttributeValueIDs: cleanAttrIDs,
+		ImagePaths:        imagePaths,
+	}
+
+	id, sku, variantCode, err := h.store.Create(in)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	return c.Status(201).JSON(fiber.Map{
+		"message":      "variant created",
+		"id":           id,
+		"sku":          sku,
+		"variant_code": variantCode,
+	})
+}
+
+func (h *Handler) Generate(c *fiber.Ctx) error {
+	var in GenerateVariantsInput
+	if err := c.BodyParser(&in); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "bad input"})
+	}
+
+	// Convert map to ordered groups for cartesian product
+	var groups [][]string
+	var attrOrder []string
+	for attrID, valueIDs := range in.AttributeValues {
+		groups = append(groups, valueIDs)
+		attrOrder = append(attrOrder, attrID)
+	}
+	// Debug output
+	fmt.Printf("Generate handler: attrOrder = %v\n", attrOrder)
+	fmt.Printf("Generate handler: groups = %v\n", groups)
+
+	ids, err := h.store.GenerateWithAttrOrder(in.ProductID, in.BasePrice, attrOrder, groups)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	return c.JSON(fiber.Map{
+		"message": "variants generated",
+		"count":   len(ids),
+	})
+}
+
+func (h *Handler) ListByProduct(c *fiber.Ctx) error {
+	rows, err := h.store.ListByProduct(c.Params("productId"))
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	defer rows.Close()
+
+	var out []fiber.Map
+
+	for rows.Next() {
+		var id, name, sku, hsnCode string
+		var variantCode int
+		var price, cost float64
+		var active bool
+
+		rows.Scan(&id, &variantCode, &name, &sku, &price, &cost, &active, &hsnCode)
+
+		out = append(out, fiber.Map{
+			"id":           id,
+			"variant_code": variantCode,
+			"name":         name,
+			"sku":          sku,
+			"price":        price,
+			"cost_price":   cost,
+			"is_active":    active,
+			"hsn_code":     hsnCode,
+		})
+	}
+
+	return c.JSON(out)
+}
+
+func (h *Handler) GetByID(c *fiber.Ctx) error {
+	id := c.Params("id")
+
+	row, _ := h.store.Get(id)
+	var variantID, productID, name, sku, barcode, hsnCode string
+	var variantCode int
+	var price, costPrice float64
+	var isActive bool
+	var productName, uom, categoryID, categoryName, description string
+	if err := row.Scan(&variantID, &productID, &variantCode, &name, &sku, &barcode, &price, &costPrice, &isActive, &hsnCode,
+		&productName, &uom, &categoryID, &categoryName, &description); err != nil {
+		return c.Status(404).JSON(fiber.Map{"error": "variant not found"})
+	}
+
+	// images
+	imgRows, err := h.store.ListImages(variantID)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	defer imgRows.Close()
+	var images []fiber.Map
+	for imgRows.Next() {
+		var imgID, url, created string
+		imgRows.Scan(&imgID, &url, &created)
+		images = append(images, fiber.Map{"id": imgID, "url": url})
+	}
+
+	// attributes
+	attributes, err := h.store.GetVariantAttributes(variantID)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	return c.JSON(fiber.Map{
+		"id":            variantID,
+		"product_id":    productID,
+		"variant_code":  variantCode,
+		"name":          name,
+		"sku":           sku,
+		"barcode":       barcode,
+		"price":         price,
+		"cost_price":    costPrice,
+		"is_active":     isActive,
+		"hsn_code":      hsnCode,
+		"product_name":  productName,
+		"uom":           uom,
+		"category_id":   categoryID,
+		"category_name": categoryName,
+		"description":   description,
+		"images":        images,
+		"attributes":    attributes,
+	})
+}
+
+func (h *Handler) Update(c *fiber.Ctx) error {
+	variantID := c.Params("id")
+
+	contentType := string(c.Request().Header.ContentType())
+
+	var in UpdateVariantInput
+
+	// Support both JSON and multipart form
+	if len(contentType) >= 19 && contentType[:19] == "multipart/form-data" {
+		form, err := c.MultipartForm()
+		if err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid form"})
+		}
+
+		if v := c.FormValue("name"); v != "" {
+			in.Name = &v
+		}
+		if v := c.FormValue("price"); v != "" {
+			p, err := strconv.ParseFloat(v, 64)
+			if err == nil {
+				in.Price = &p
+			}
+		}
+		if v := c.FormValue("cost_price"); v != "" {
+			cp, err := strconv.ParseFloat(v, 64)
+			if err == nil {
+				in.CostPrice = &cp
+			}
+		}
+
+		for _, id := range form.Value["attribute_value_ids[]"] {
+			if id != "" {
+				in.AttributeValueIDs = append(in.AttributeValueIDs, id)
+			}
+		}
+		// fallback: try without []
+		if len(in.AttributeValueIDs) == 0 {
+			for _, id := range form.Value["attribute_value_ids"] {
+				if id != "" {
+					in.AttributeValueIDs = append(in.AttributeValueIDs, id)
+				}
+			}
+		}
+		fmt.Println("Update: attribute_value_ids =", in.AttributeValueIDs)
+
+		if v := c.FormValue("variant_code"); v != "" {
+			vc, err := strconv.Atoi(v)
+			if err == nil {
+				in.VariantCode = &vc
+			}
+		}
+
+		// Handle new image uploads
+		files := form.File["images"]
+		fmt.Println("Update: image files count =", len(files))
+		for _, file := range files {
+			data, fname, err := storage.ProcessImage(file)
+			if err != nil {
+				fmt.Println("Update: image process error:", err)
+				continue
+			}
+			url, err := storage.UploadFile("variants/"+fname, data, file.Header.Get("Content-Type"))
+			if err != nil {
+				fmt.Println("Update: image upload error:", err)
+				continue
+			}
+			fmt.Println("Update: inserted image url =", url)
+			_ = h.store.InsertImage(variantID, url)
+		}
+	} else {
+		if err := c.BodyParser(&in); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "bad input"})
+		}
+	}
+
+	if err := h.store.Update(variantID, in); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	return c.JSON(fiber.Map{"message": "variant updated"})
+}
+
+func (h *Handler) Deactivate(c *fiber.Ctx) error {
+	return h.toggle(c, false)
+}
+
+func (h *Handler) Activate(c *fiber.Ctx) error {
+	return h.toggle(c, true)
+}
+
+func (h *Handler) toggle(c *fiber.Ctx, active bool) error {
+	if err := h.store.SetActive(c.Params("id"), active); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"message": "status updated"})
+}
+
+func (h *Handler) BackfillVariantCodes(c *fiber.Ctx) error {
+	count, err := h.store.BackfillVariantCodes()
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{
+		"message": fmt.Sprintf("assigned variant_code to %d variants", count),
+		"count":   count,
+	})
+}
+
+func (h *Handler) Search(c *fiber.Ctx) error {
+	q := c.Query("q")
+	if q == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "q query param is required"})
+	}
+	warehouseID := c.Query("warehouse_id")
+	results, err := h.store.Search(q, warehouseID)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(results)
+}
+
+func (h *Handler) GetByCode(c *fiber.Ctx) error {
+	code := c.Params("code")
+	result, err := h.store.GetByCode(code)
+	if err != nil {
+		return c.Status(404).JSON(fiber.Map{"error": "no active variant found with code " + code})
+	}
+	return c.JSON(result)
+}
+
+func (h *Handler) ItemMaster(c *fiber.Ctx) error {
+	user := c.Locals("user").(*model.User)
+
+	// Determine warehouse scope
+	warehouseID := ""
+	if user.Role.Name == model.RoleStoreManager {
+		if user.BranchID == nil {
+			return c.Status(403).JSON(fiber.Map{"error": "Your account has no branch assigned"})
+		}
+		err := h.store.db.QueryRow(
+			`SELECT id FROM warehouses WHERE branch_id = $1 LIMIT 1`, *user.BranchID,
+		).Scan(&warehouseID)
+		if err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "No warehouse found for your branch"})
+		}
+	}
+
+	// Pagination: if limit param absent/empty → return all (limit=0)
+	limitStr := c.Query("limit")
+	offsetStr := c.Query("offset")
+	limit := 0
+	offset := 0
+	if limitStr != "" {
+		limit, _ = strconv.Atoi(limitStr)
+		if limit < 0 {
+			limit = 0
+		}
+	}
+	if offsetStr != "" {
+		offset, _ = strconv.Atoi(offsetStr)
+		if offset < 0 {
+			offset = 0
+		}
+	}
+
+	variantCode := c.Query("variant_code")
+
+	items, total, err := h.store.ItemMaster(warehouseID, variantCode, limit, offset)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	return c.JSON(fiber.Map{
+		"items":  items,
+		"total":  total,
+		"limit":  limit,
+		"offset": offset,
+	})
+}

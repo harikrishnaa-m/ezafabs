@@ -1,0 +1,3145 @@
+package migration
+
+import (
+	"bytes"
+	"database/sql"
+	"fmt"
+	"math"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/xuri/excelize/v2"
+)
+
+// ── Types ────────────────────────────────────────────────────
+
+type Store struct {
+	db *sql.DB
+}
+
+func NewStore(db *sql.DB) *Store {
+	return &Store{db: db}
+}
+
+// XlsxRow is one parsed row from an xlsx sheet.
+type XlsxRow struct {
+	ItemName    string
+	Code        int
+	MRP         float64 // GST-inclusive selling price (stored as variants.price)
+	CostPrice   float64 // base price excl. GST (stored as variants.cost_price); 0 if column absent
+	Qty         float64 // 0 when cell is empty
+	CategoryKey string  // derived from file name
+}
+
+// ImportResult is returned to the caller after a full import.
+type ImportResult struct {
+	CategoriesCreated int              `json:"categories_created"`
+	ProductsCreated   int              `json:"products_created"`
+	VariantsCreated   int              `json:"variants_created"`
+	StockRowsCreated  int              `json:"stock_rows_created"`
+	TotalQtyImported  float64          `json:"total_qty_imported"`
+	PerCategory       []CategoryResult `json:"per_category"`
+}
+
+type CategoryResult struct {
+	Name     string  `json:"name"`
+	Products int     `json:"products"`
+	Variants int     `json:"variants"`
+	TotalQty float64 `json:"total_qty"`
+}
+
+// UpsertDryRunResult is returned by DryRunUpsertMRP — no DB writes are made.
+type UpsertDryRunResult struct {
+	TotalVariantsInFiles int                    `json:"total_variants_in_files"`
+	VariantsToUpdate     int                    `json:"variants_to_update"`
+	VariantsToInsert     int                    `json:"variants_to_insert"`
+	ProductsToCreate     int                    `json:"products_to_create"`
+	CategoriesToCreate   int                    `json:"categories_to_create"`
+	PerCategory          []UpsertDryRunCategory `json:"per_category"`
+}
+
+type UpsertDryRunCategory struct {
+	Name             string  `json:"name"`
+	ExistsInDB       bool    `json:"exists_in_db"`
+	VariantsToUpdate int     `json:"variants_to_update"`
+	VariantsToInsert int     `json:"variants_to_insert"`
+	ProductsToCreate int     `json:"products_to_create"`
+	TotalQty         float64 `json:"total_qty"`
+}
+
+// ── Public entry point ───────────────────────────────────────
+
+// ImportFolder reads every .xlsx inside folderPath, maps:
+//
+//	file name → category
+//	item name → product (grouped within the same category)
+//	code      → variant  (grouped by item name + code + MRP within a category)
+//
+// branchName / warehouseName are looked up (or created) so stock rows land in
+// the correct warehouse.
+func (s *Store) ImportFolder(folderPath, branchName string) (*ImportResult, error) {
+	// 1. Resolve branch + warehouse
+	branchID, warehouseID, err := s.resolveBranchAndWarehouse(branchName)
+	if err != nil {
+		return nil, fmt.Errorf("branch/warehouse: %w", err)
+	}
+	_ = branchID
+
+	// 2. Discover all .xlsx files
+	files, err := filepath.Glob(filepath.Join(folderPath, "*.xlsx"))
+	if err != nil {
+		return nil, fmt.Errorf("glob: %w", err)
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no .xlsx files found in %s", folderPath)
+	}
+
+	// 3. Parse ALL files first (no DB hits)
+	type parsedFile struct {
+		catName string
+		rows    []XlsxRow
+	}
+	var parsed []parsedFile
+	for _, file := range files {
+		catName := categoryNameFromFile(file)
+		rows, err := parseXlsx(file, catName)
+		if err != nil {
+			return nil, fmt.Errorf("parse %s: %w", filepath.Base(file), err)
+		}
+		parsed = append(parsed, parsedFile{catName: catName, rows: rows})
+	}
+
+	// 4. Flatten all data into bulk structures
+	type variantKey struct {
+		catName  string
+		itemName string
+		code     int
+	}
+	type variantData struct {
+		mrp       float64
+		costPrice float64
+		qty       float64
+	}
+
+	catNames := make(map[string]bool)
+	type productKey struct {
+		catName  string
+		itemName string
+	}
+	prodKeys := make(map[productKey]bool)
+	variantMap := make(map[variantKey]*variantData)
+
+	for _, pf := range parsed {
+		catNames[pf.catName] = true
+		for _, r := range pf.rows {
+			prodKeys[productKey{catName: pf.catName, itemName: r.ItemName}] = true
+			vk := variantKey{catName: pf.catName, itemName: r.ItemName, code: r.Code}
+			if vd, ok := variantMap[vk]; ok {
+				vd.qty += r.Qty
+				vd.mrp = r.MRP // take latest MRP
+				if r.CostPrice > 0 {
+					vd.costPrice = r.CostPrice
+				}
+			} else {
+				variantMap[vk] = &variantData{mrp: r.MRP, costPrice: r.CostPrice, qty: r.Qty}
+			}
+		}
+	}
+
+	// 5. Single transaction with bulk operations
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// ── Bulk insert categories ──
+	catIDs := make(map[string]uuid.UUID)
+	for catName := range catNames {
+		id := uuid.New()
+		err := tx.QueryRow(
+			`INSERT INTO categories (id, name, is_active) VALUES ($1, $2, true)
+			 ON CONFLICT (name) DO UPDATE SET name = categories.name
+			 RETURNING id`,
+			id, catName,
+		).Scan(&id)
+		if err != nil {
+			return nil, fmt.Errorf("category %s: %w", catName, err)
+		}
+		catIDs[catName] = id
+	}
+
+	// ── Bulk insert products (multi-row VALUES, batches of 500) ──
+	type prodInfo struct {
+		catName  string
+		itemName string
+		id       uuid.UUID
+		catID    uuid.UUID
+	}
+	var allProds []prodInfo
+	for pk := range prodKeys {
+		allProds = append(allProds, prodInfo{
+			catName:  pk.catName,
+			itemName: pk.itemName,
+			id:       uuid.New(),
+			catID:    catIDs[pk.catName],
+		})
+	}
+
+	const prodBatchSize = 500
+	for i := 0; i < len(allProds); i += prodBatchSize {
+		end := i + prodBatchSize
+		if end > len(allProds) {
+			end = len(allProds)
+		}
+		batch := allProds[i:end]
+
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO products (id, name, category_id, is_active, is_web_visible, uom) VALUES `)
+		args := make([]interface{}, 0, len(batch)*3)
+		for j, p := range batch {
+			if j > 0 {
+				sb.WriteString(", ")
+			}
+			base := j * 3
+			fmt.Fprintf(&sb, "($%d, $%d, $%d, true, true, 'Unit')", base+1, base+2, base+3)
+			args = append(args, p.id, p.itemName, p.catID)
+		}
+		sb.WriteString(` ON CONFLICT DO NOTHING`)
+
+		if _, err := tx.Exec(sb.String(), args...); err != nil {
+			return nil, fmt.Errorf("bulk product insert: %w", err)
+		}
+	}
+
+	// ── Bulk SELECT all product IDs for our categories ──
+	catNameByID := make(map[uuid.UUID]string)
+	catIDSlice := make([]interface{}, 0, len(catIDs))
+	for name, id := range catIDs {
+		catNameByID[id] = name
+		catIDSlice = append(catIDSlice, id)
+	}
+
+	prodIDs := make(map[string]uuid.UUID) // "catName|lowerItemName" → id
+	{
+		var sb strings.Builder
+		sb.WriteString(`SELECT id, LOWER(name), category_id FROM products WHERE category_id IN (`)
+		for i := range catIDSlice {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			fmt.Fprintf(&sb, "$%d", i+1)
+		}
+		sb.WriteString(`)`)
+
+		rows, err := tx.Query(sb.String(), catIDSlice...)
+		if err != nil {
+			return nil, fmt.Errorf("product lookup: %w", err)
+		}
+		for rows.Next() {
+			var id, catID uuid.UUID
+			var lowerName string
+			if err := rows.Scan(&id, &lowerName, &catID); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan product: %w", err)
+			}
+			prodIDs[catNameByID[catID]+"|"+lowerName] = id
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("product rows: %w", err)
+		}
+		rows.Close()
+	}
+
+	// ── Pre-generate all variant + stock data ──
+	type variantRow struct {
+		id        uuid.UUID
+		productID uuid.UUID
+		code      int
+		name      string
+		sku       string
+		barcode   string
+		mrp       float64
+		costPrice float64
+		qty       float64
+		catName   string
+		itemName  string
+	}
+	allVariants := make([]variantRow, 0, len(variantMap))
+	for vk, vd := range variantMap {
+		prodKey := vk.catName + "|" + strings.ToLower(vk.itemName)
+		productID := prodIDs[prodKey]
+		costP := vd.costPrice
+		if costP <= 0 {
+			costP = vd.mrp // fallback: cost_price = mrp if no excl-GST column
+		}
+		allVariants = append(allVariants, variantRow{
+			id:        uuid.New(),
+			productID: productID,
+			code:      vk.code,
+			name:      fmt.Sprintf("%s - %d", vk.itemName, vk.code),
+			sku:       generateSKU(vk.catName, vk.code),
+			barcode:   generateBarcode(),
+			mrp:       vd.mrp,
+			costPrice: costP,
+			qty:       math.Round(vd.qty*100) / 100,
+			catName:   vk.catName,
+			itemName:  vk.itemName,
+		})
+	}
+
+	// ── Bulk insert variants (multi-row VALUES, batches of 500) ──
+	// 7 unique params per row: id, product_id, variant_code, name, sku, barcode, price
+	const varBatchSize = 500
+	for i := 0; i < len(allVariants); i += varBatchSize {
+		end := i + varBatchSize
+		if end > len(allVariants) {
+			end = len(allVariants)
+		}
+		batch := allVariants[i:end]
+
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO variants (id, product_id, variant_code, name, sku, barcode, price, cost_price, is_active) VALUES `)
+		args := make([]interface{}, 0, len(batch)*8)
+		for j, v := range batch {
+			if j > 0 {
+				sb.WriteString(", ")
+			}
+			base := j * 8
+			fmt.Fprintf(&sb, "($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, true)",
+				base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8)
+			args = append(args, v.id, v.productID, v.code, v.name, v.sku, v.barcode, v.mrp, v.costPrice)
+		}
+
+		if _, err := tx.Exec(sb.String(), args...); err != nil {
+			return nil, fmt.Errorf("bulk variant insert: %w", err)
+		}
+	}
+
+	// ── Bulk upsert stock (multi-row VALUES, batches of 500) ──
+	// 3 params per row: variant_id, warehouse_id, quantity
+	const stockBatchSize = 500
+	for i := 0; i < len(allVariants); i += stockBatchSize {
+		end := i + stockBatchSize
+		if end > len(allVariants) {
+			end = len(allVariants)
+		}
+		batch := allVariants[i:end]
+
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO stocks (id, variant_id, warehouse_id, quantity, stock_type) VALUES `)
+		args := make([]interface{}, 0, len(batch)*3)
+		for j, v := range batch {
+			if j > 0 {
+				sb.WriteString(", ")
+			}
+			base := j * 3
+			fmt.Fprintf(&sb, "(uuid_generate_v4(), $%d, $%d, $%d, 'PRODUCT')", base+1, base+2, base+3)
+			args = append(args, v.id, warehouseID, v.qty)
+		}
+		sb.WriteString(` ON CONFLICT (variant_id, warehouse_id)
+		 DO UPDATE SET quantity = stocks.quantity + EXCLUDED.quantity, updated_at = NOW()`)
+
+		if _, err := tx.Exec(sb.String(), args...); err != nil {
+			return nil, fmt.Errorf("bulk stock upsert: %w", err)
+		}
+	}
+
+	// ── Gather results ──
+	result := &ImportResult{}
+	catVariantCount := make(map[string]int)
+	catQty := make(map[string]float64)
+	catProducts := make(map[string]map[string]bool)
+
+	for _, v := range allVariants {
+		catVariantCount[v.catName]++
+		catQty[v.catName] += v.qty
+		if catProducts[v.catName] == nil {
+			catProducts[v.catName] = make(map[string]bool)
+		}
+		catProducts[v.catName][v.itemName] = true
+	}
+
+	// ── Update category counts ──
+	for catName, catID := range catIDs {
+		if _, err := tx.Exec(
+			`UPDATE categories SET products_count = (
+				SELECT COUNT(*) FROM products WHERE category_id = $1
+			 ) WHERE id = $1`, catID,
+		); err != nil {
+			return nil, err
+		}
+
+		cr := CategoryResult{
+			Name:     catName,
+			Products: len(catProducts[catName]),
+			Variants: catVariantCount[catName],
+			TotalQty: catQty[catName],
+		}
+		result.CategoriesCreated++
+		result.ProductsCreated += cr.Products
+		result.VariantsCreated += cr.Variants
+		result.StockRowsCreated += cr.Variants
+		result.TotalQtyImported += cr.TotalQty
+		result.PerCategory = append(result.PerCategory, cr)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit: %w", err)
+	}
+
+	return result, nil
+}
+
+// ── UpsertFolderMRP ──────────────────────────────────────────────────────────
+//
+// Like ImportFolder but with full upsert semantics for variants:
+//   - Category    : upserted (created if absent)
+//   - Product     : upserted (created if absent)
+//   - Variant     : if (product_id + variant_code) already exists → UPDATE price/cost_price
+//     otherwise → INSERT new variant
+//   - Stock       : quantity is ADDED for existing rows, created for new ones
+func (s *Store) UpsertFolderMRP(folderPath, branchName string) (*ImportResult, error) {
+	branchID, warehouseID, err := s.resolveBranchAndWarehouse(branchName)
+	if err != nil {
+		return nil, fmt.Errorf("branch/warehouse: %w", err)
+	}
+	_ = branchID
+
+	files, err := filepath.Glob(filepath.Join(folderPath, "*.xlsx"))
+	if err != nil || len(files) == 0 {
+		return nil, fmt.Errorf("no .xlsx files found in %s", folderPath)
+	}
+
+	// ── Parse all files (no DB) ──
+	type parsedFile struct {
+		catName string
+		rows    []XlsxRow
+	}
+	var parsed []parsedFile
+	for _, file := range files {
+		catName := categoryNameFromFile(file)
+		rows, err := parseXlsx(file, catName)
+		if err != nil {
+			return nil, fmt.Errorf("parse %s: %w", filepath.Base(file), err)
+		}
+		parsed = append(parsed, parsedFile{catName: catName, rows: rows})
+	}
+
+	// ── Flatten into dedup maps ──
+	type variantKey struct {
+		catName  string
+		itemName string
+		code     int
+	}
+	type variantData struct {
+		mrp       float64
+		costPrice float64
+		qty       float64
+	}
+	type productKey struct {
+		catName  string
+		itemName string
+	}
+
+	catNames := make(map[string]bool)
+	prodKeys := make(map[productKey]bool)
+	variantMap := make(map[variantKey]*variantData)
+
+	for _, pf := range parsed {
+		catNames[pf.catName] = true
+		for _, r := range pf.rows {
+			prodKeys[productKey{catName: pf.catName, itemName: r.ItemName}] = true
+			vk := variantKey{catName: pf.catName, itemName: r.ItemName, code: r.Code}
+			if vd, ok := variantMap[vk]; ok {
+				vd.qty += r.Qty
+				vd.mrp = r.MRP
+				if r.CostPrice > 0 {
+					vd.costPrice = r.CostPrice
+				}
+			} else {
+				variantMap[vk] = &variantData{mrp: r.MRP, costPrice: r.CostPrice, qty: r.Qty}
+			}
+		}
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// ── Upsert categories ──
+	catIDs := make(map[string]uuid.UUID)
+	for catName := range catNames {
+		id := uuid.New()
+		err := tx.QueryRow(
+			`INSERT INTO categories (id, name, is_active) VALUES ($1, $2, true)
+			 ON CONFLICT (name) DO UPDATE SET name = categories.name
+			 RETURNING id`,
+			id, catName,
+		).Scan(&id)
+		if err != nil {
+			return nil, fmt.Errorf("category %s: %w", catName, err)
+		}
+		catIDs[catName] = id
+	}
+
+	// ── Upsert products ──
+	type prodInfo struct {
+		catName  string
+		itemName string
+		id       uuid.UUID
+		catID    uuid.UUID
+	}
+	var allProds []prodInfo
+	for pk := range prodKeys {
+		allProds = append(allProds, prodInfo{
+			catName:  pk.catName,
+			itemName: pk.itemName,
+			id:       uuid.New(),
+			catID:    catIDs[pk.catName],
+		})
+	}
+
+	const prodBatchSize = 500
+	for i := 0; i < len(allProds); i += prodBatchSize {
+		end := i + prodBatchSize
+		if end > len(allProds) {
+			end = len(allProds)
+		}
+		batch := allProds[i:end]
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO products (id, name, category_id, is_active, is_web_visible, uom) VALUES `)
+		args := make([]interface{}, 0, len(batch)*3)
+		for j, p := range batch {
+			if j > 0 {
+				sb.WriteString(", ")
+			}
+			base := j * 3
+			fmt.Fprintf(&sb, "($%d, $%d, $%d, true, true, 'Unit')", base+1, base+2, base+3)
+			args = append(args, p.id, p.itemName, p.catID)
+		}
+		sb.WriteString(` ON CONFLICT DO NOTHING`)
+		if _, err := tx.Exec(sb.String(), args...); err != nil {
+			return nil, fmt.Errorf("bulk product insert: %w", err)
+		}
+	}
+
+	// ── Fetch all product IDs for our categories ──
+	catNameByID := make(map[uuid.UUID]string)
+	catIDSlice := make([]interface{}, 0, len(catIDs))
+	for name, id := range catIDs {
+		catNameByID[id] = name
+		catIDSlice = append(catIDSlice, id)
+	}
+	prodIDs := make(map[string]uuid.UUID) // "catName|lowerItemName" → id
+	{
+		var sb strings.Builder
+		sb.WriteString(`SELECT id, LOWER(name), category_id FROM products WHERE category_id IN (`)
+		for i := range catIDSlice {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			fmt.Fprintf(&sb, "$%d", i+1)
+		}
+		sb.WriteString(`)`)
+		rows, err := tx.Query(sb.String(), catIDSlice...)
+		if err != nil {
+			return nil, fmt.Errorf("product lookup: %w", err)
+		}
+		for rows.Next() {
+			var id, catID uuid.UUID
+			var lowerName string
+			if err := rows.Scan(&id, &lowerName, &catID); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan product: %w", err)
+			}
+			prodIDs[catNameByID[catID]+"|"+lowerName] = id
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("product rows: %w", err)
+		}
+	}
+
+	// ── Build variant rows ──
+	type variantRow struct {
+		id        uuid.UUID
+		productID uuid.UUID
+		code      int
+		name      string
+		sku       string
+		barcode   string
+		mrp       float64
+		costPrice float64
+		qty       float64
+		catName   string
+		itemName  string
+	}
+	allVariants := make([]variantRow, 0, len(variantMap))
+	for vk, vd := range variantMap {
+		productID := prodIDs[vk.catName+"|"+strings.ToLower(vk.itemName)]
+		costP := vd.costPrice
+		if costP <= 0 {
+			costP = vd.mrp
+		}
+		allVariants = append(allVariants, variantRow{
+			id:        uuid.New(),
+			productID: productID,
+			code:      vk.code,
+			name:      fmt.Sprintf("%s - %d", vk.itemName, vk.code),
+			sku:       generateSKU(vk.catName, vk.code),
+			barcode:   generateBarcode(),
+			mrp:       vd.mrp,
+			costPrice: costP,
+			qty:       math.Round(vd.qty*100) / 100,
+			catName:   vk.catName,
+			itemName:  vk.itemName,
+		})
+	}
+
+	// ── Variant upsert via staging table ──
+	if _, err := tx.Exec(`
+		CREATE TEMP TABLE _upsert_variants (
+			id           UUID,
+			product_id   UUID,
+			variant_code INT,
+			name         TEXT,
+			sku          TEXT,
+			barcode      TEXT,
+			mrp          NUMERIC,
+			cost_price   NUMERIC,
+			qty          NUMERIC
+		) ON COMMIT DROP
+	`); err != nil {
+		return nil, fmt.Errorf("create staging: %w", err)
+	}
+
+	const varBatchSize = 500
+	for i := 0; i < len(allVariants); i += varBatchSize {
+		end := i + varBatchSize
+		if end > len(allVariants) {
+			end = len(allVariants)
+		}
+		batch := allVariants[i:end]
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO _upsert_variants (id, product_id, variant_code, name, sku, barcode, mrp, cost_price, qty) VALUES `)
+		args := make([]interface{}, 0, len(batch)*9)
+		for j, v := range batch {
+			if j > 0 {
+				sb.WriteString(", ")
+			}
+			base := j * 9
+			fmt.Fprintf(&sb, "($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
+				base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9)
+			args = append(args, v.id, v.productID, v.code, v.name, v.sku, v.barcode, v.mrp, v.costPrice, v.qty)
+		}
+		if _, err := tx.Exec(sb.String(), args...); err != nil {
+			return nil, fmt.Errorf("bulk staging insert: %w", err)
+		}
+	}
+
+	// UPDATE price/cost_price for variants that already exist
+	if _, err := tx.Exec(`
+		UPDATE variants v
+		SET price      = s.mrp,
+		    cost_price = s.cost_price,
+		    updated_at = NOW()
+		FROM _upsert_variants s
+		WHERE v.product_id   = s.product_id
+		  AND v.variant_code = s.variant_code
+	`); err != nil {
+		return nil, fmt.Errorf("variant price update: %w", err)
+	}
+
+	// INSERT variants that don't exist yet
+	if _, err := tx.Exec(`
+		INSERT INTO variants (id, product_id, variant_code, name, sku, barcode, price, cost_price, is_active)
+		SELECT s.id, s.product_id, s.variant_code, s.name, s.sku, s.barcode, s.mrp, s.cost_price, true
+		FROM _upsert_variants s
+		WHERE NOT EXISTS (
+			SELECT 1 FROM variants v
+			WHERE v.product_id = s.product_id AND v.variant_code = s.variant_code
+		)
+	`); err != nil {
+		return nil, fmt.Errorf("variant insert: %w", err)
+	}
+
+	// ── Stock upsert — look up final variant IDs from DB ──
+	// (covers both pre-existing and newly inserted variants)
+	// GROUP BY v.id so each variant appears exactly once even if multiple
+	// staging rows matched it (avoids "ON CONFLICT DO UPDATE affects row twice").
+	type stockRow struct {
+		variantID uuid.UUID
+		qty       float64
+	}
+	var stockRows []stockRow
+	{
+		rows, err := tx.Query(`
+			SELECT v.id, SUM(s.qty)
+			FROM variants v
+			JOIN _upsert_variants s ON s.product_id = v.product_id AND s.variant_code = v.variant_code
+			GROUP BY v.id
+		`)
+		if err != nil {
+			return nil, fmt.Errorf("stock lookup: %w", err)
+		}
+		for rows.Next() {
+			var sr stockRow
+			if err := rows.Scan(&sr.variantID, &sr.qty); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan stock row: %w", err)
+			}
+			stockRows = append(stockRows, sr)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("stock rows err: %w", err)
+		}
+	}
+
+	const stockBatchSize = 500
+	for i := 0; i < len(stockRows); i += stockBatchSize {
+		end := i + stockBatchSize
+		if end > len(stockRows) {
+			end = len(stockRows)
+		}
+		batch := stockRows[i:end]
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO stocks (id, variant_id, warehouse_id, quantity, stock_type) VALUES `)
+		args := make([]interface{}, 0, len(batch)*3)
+		for j, sr := range batch {
+			if j > 0 {
+				sb.WriteString(", ")
+			}
+			base := j * 3
+			fmt.Fprintf(&sb, "(uuid_generate_v4(), $%d, $%d, $%d, 'PRODUCT')", base+1, base+2, base+3)
+			args = append(args, sr.variantID, warehouseID, sr.qty)
+		}
+		sb.WriteString(` ON CONFLICT (variant_id, warehouse_id)
+		 DO UPDATE SET quantity = stocks.quantity + EXCLUDED.quantity, updated_at = NOW()`)
+		if _, err := tx.Exec(sb.String(), args...); err != nil {
+			return nil, fmt.Errorf("bulk stock upsert: %w", err)
+		}
+	}
+
+	// ── Build result ──
+	result := &ImportResult{}
+	catVariantCount := make(map[string]int)
+	catQty := make(map[string]float64)
+	catProducts := make(map[string]map[string]bool)
+	for _, v := range allVariants {
+		catVariantCount[v.catName]++
+		catQty[v.catName] += v.qty
+		if catProducts[v.catName] == nil {
+			catProducts[v.catName] = make(map[string]bool)
+		}
+		catProducts[v.catName][v.itemName] = true
+	}
+	for catName, catID := range catIDs {
+		if _, err := tx.Exec(
+			`UPDATE categories SET products_count = (
+				SELECT COUNT(*) FROM products WHERE category_id = $1
+			 ) WHERE id = $1`, catID,
+		); err != nil {
+			return nil, err
+		}
+		cr := CategoryResult{
+			Name:     catName,
+			Products: len(catProducts[catName]),
+			Variants: catVariantCount[catName],
+			TotalQty: catQty[catName],
+		}
+		result.CategoriesCreated++
+		result.ProductsCreated += cr.Products
+		result.VariantsCreated += cr.Variants
+		result.StockRowsCreated += cr.Variants
+		result.TotalQtyImported += cr.TotalQty
+		result.PerCategory = append(result.PerCategory, cr)
+	}
+
+	return result, tx.Commit()
+}
+
+// ── DryRunUpsertMRP ──────────────────────────────────────────────────────────
+//
+// Read-only preview of what UpsertFolderMRP would do:
+//   - Parses all xlsx files in folderPath
+//   - Queries the DB (no writes) to classify each variant as update vs insert
+//   - Returns per-category breakdown
+func (s *Store) DryRunUpsertMRP(folderPath string) (*UpsertDryRunResult, error) {
+	files, err := filepath.Glob(filepath.Join(folderPath, "*.xlsx"))
+	if err != nil || len(files) == 0 {
+		return nil, fmt.Errorf("no .xlsx files found in %s", folderPath)
+	}
+
+	// ── Parse all files (no DB) ──
+	type parsedFile struct {
+		catName string
+		rows    []XlsxRow
+	}
+	var parsed []parsedFile
+	for _, file := range files {
+		catName := categoryNameFromFile(file)
+		rows, err := parseXlsx(file, catName)
+		if err != nil {
+			return nil, fmt.Errorf("parse %s: %w", filepath.Base(file), err)
+		}
+		parsed = append(parsed, parsedFile{catName: catName, rows: rows})
+	}
+
+	// ── Build dedup maps ──
+	type variantKey struct {
+		catName  string
+		itemName string
+		code     int
+	}
+	type productKey struct {
+		catName  string
+		itemName string
+	}
+	catNames := make(map[string]bool)
+	prodKeys := make(map[productKey]bool)
+	variantQty := make(map[variantKey]float64)
+
+	for _, pf := range parsed {
+		catNames[pf.catName] = true
+		for _, r := range pf.rows {
+			prodKeys[productKey{catName: pf.catName, itemName: r.ItemName}] = true
+			vk := variantKey{catName: pf.catName, itemName: r.ItemName, code: r.Code}
+			variantQty[vk] += r.Qty
+		}
+	}
+
+	// ── Read-only DB lookups ──
+
+	// 1. Which categories already exist?
+	catNameSlice := make([]string, 0, len(catNames))
+	for cn := range catNames {
+		catNameSlice = append(catNameSlice, cn)
+	}
+	existingCatIDs := make(map[string]uuid.UUID) // catName → id
+	{
+		var sb strings.Builder
+		args := make([]interface{}, len(catNameSlice))
+		for i, cn := range catNameSlice {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			fmt.Fprintf(&sb, "$%d", i+1)
+			args[i] = cn
+		}
+		rows, err := s.db.Query(`SELECT id, name FROM categories WHERE name IN (`+sb.String()+`)`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("category lookup: %w", err)
+		}
+		for rows.Next() {
+			var id uuid.UUID
+			var name string
+			if err := rows.Scan(&id, &name); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan category: %w", err)
+			}
+			existingCatIDs[name] = id
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("category rows: %w", err)
+		}
+	}
+
+	// 2. Which products already exist (in the existing categories)?
+	existingProdIDs := make(map[string]uuid.UUID) // "catName|lowerItemName" → id
+	catIDToCatName := make(map[uuid.UUID]string)
+	if len(existingCatIDs) > 0 {
+		catIDSlice := make([]interface{}, 0, len(existingCatIDs))
+		for cn, id := range existingCatIDs {
+			catIDSlice = append(catIDSlice, id)
+			catIDToCatName[id] = cn
+		}
+		var sb strings.Builder
+		for i := range catIDSlice {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			fmt.Fprintf(&sb, "$%d", i+1)
+		}
+		rows, err := s.db.Query(
+			`SELECT id, LOWER(name), category_id FROM products WHERE category_id IN (`+sb.String()+`)`,
+			catIDSlice...,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("product lookup: %w", err)
+		}
+		for rows.Next() {
+			var id, catID uuid.UUID
+			var lowerName string
+			if err := rows.Scan(&id, &lowerName, &catID); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan product: %w", err)
+			}
+			existingProdIDs[catIDToCatName[catID]+"|"+lowerName] = id
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("product rows: %w", err)
+		}
+	}
+
+	// 3. Which variants already exist (in the existing products)?
+	existingVariants := make(map[string]bool) // "catName|lowerItemName|code" → true
+	if len(existingProdIDs) > 0 {
+		prodIDSlice := make([]interface{}, 0, len(existingProdIDs))
+		prodIDToKey := make(map[uuid.UUID]string)
+		for key, id := range existingProdIDs {
+			prodIDSlice = append(prodIDSlice, id)
+			prodIDToKey[id] = key
+		}
+		var sb strings.Builder
+		for i := range prodIDSlice {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			fmt.Fprintf(&sb, "$%d", i+1)
+		}
+		rows, err := s.db.Query(
+			`SELECT product_id, variant_code FROM variants WHERE product_id IN (`+sb.String()+`)`,
+			prodIDSlice...,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("variant lookup: %w", err)
+		}
+		for rows.Next() {
+			var prodID uuid.UUID
+			var code int
+			if err := rows.Scan(&prodID, &code); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan variant: %w", err)
+			}
+			existingVariants[fmt.Sprintf("%s|%d", prodIDToKey[prodID], code)] = true
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("variant rows: %w", err)
+		}
+	}
+
+	// ── Classify ──
+	result := &UpsertDryRunResult{}
+	perCat := make(map[string]*UpsertDryRunCategory)
+
+	for cn := range catNames {
+		_, exists := existingCatIDs[cn]
+		perCat[cn] = &UpsertDryRunCategory{Name: cn, ExistsInDB: exists}
+		if !exists {
+			result.CategoriesToCreate++
+		}
+	}
+
+	for pk := range prodKeys {
+		prodLookupKey := pk.catName + "|" + strings.ToLower(pk.itemName)
+		if _, exists := existingProdIDs[prodLookupKey]; !exists {
+			result.ProductsToCreate++
+			perCat[pk.catName].ProductsToCreate++
+		}
+	}
+
+	for vk, qty := range variantQty {
+		prodLookupKey := vk.catName + "|" + strings.ToLower(vk.itemName)
+		varLookupKey := fmt.Sprintf("%s|%d", prodLookupKey, vk.code)
+		cat := perCat[vk.catName]
+		cat.TotalQty += qty
+		result.TotalVariantsInFiles++
+		if existingVariants[varLookupKey] {
+			result.VariantsToUpdate++
+			cat.VariantsToUpdate++
+		} else {
+			result.VariantsToInsert++
+			cat.VariantsToInsert++
+		}
+	}
+
+	for _, cat := range perCat {
+		result.PerCategory = append(result.PerCategory, *cat)
+	}
+
+	return result, nil
+}
+
+// ── Parse xlsx ───────────────────────────────────────────────
+
+func categoryNameFromFile(path string) string {
+	base := filepath.Base(path)
+	name := strings.TrimSuffix(base, filepath.Ext(base))
+	// Title-case & clean up
+	name = strings.TrimSpace(name)
+	return name
+}
+
+// parseXlsx reads every sheet of a workbook and returns flat rows.
+func parseXlsx(path, catKey string) ([]XlsxRow, error) {
+	f, err := excelize.OpenFile(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var rows []XlsxRow
+
+	for _, sheet := range f.GetSheetList() {
+		allRows, err := f.GetRows(sheet)
+		if err != nil {
+			continue
+		}
+		if len(allRows) == 0 {
+			continue
+		}
+
+		// Detect column layout from header row
+		colMap := detectColumns(allRows)
+		if colMap == nil {
+			continue // can't figure out columns
+		}
+
+		for i, row := range allRows {
+			if i <= colMap.headerRow {
+				continue // skip header and rows before it
+			}
+			if len(row) == 0 {
+				continue
+			}
+
+			item := safeCol(row, colMap.itemIdx)
+			codeStr := safeCol(row, colMap.codeIdx)
+			// Use GST-inclusive MRP as the selling price.
+			// If only an excl-GST column exists, fall back to that.
+			var mrpStr string
+			if colMap.mrpIdx >= 0 {
+				mrpStr = safeCol(row, colMap.mrpIdx)
+			}
+			if mrpStr == "" {
+				mrpStr = safeCol(row, colMap.mrpExclGstIdx)
+			}
+			// Separately capture base price (excl. GST) for cost_price
+			var costPriceStr string
+			if colMap.mrpExclGstIdx >= 0 {
+				costPriceStr = safeCol(row, colMap.mrpExclGstIdx)
+			}
+			qtyStr := safeCol(row, colMap.qtyIdx)
+
+			if codeStr == "" {
+				continue // no code → skip
+			}
+
+			code := parseFloat(codeStr)
+			if code == 0 {
+				continue
+			}
+
+			mrp := parseFloat(mrpStr)
+			costPrice := parseFloat(costPriceStr)
+			qty := parseFloat(qtyStr) // returns 0 for empty/nil
+
+			// If item is empty, use category key as fallback
+			if item == "" {
+				item = catKey
+			}
+
+			rows = append(rows, XlsxRow{
+				ItemName:    cleanItemName(item),
+				Code:        int(code),
+				MRP:         mrp,
+				CostPrice:   costPrice,
+				Qty:         qty,
+				CategoryKey: catKey,
+			})
+		}
+	}
+	return rows, nil
+}
+
+// colLayout stores detected column indices for a sheet.
+type colLayout struct {
+	headerRow     int
+	itemIdx       int
+	codeIdx       int
+	mrpIdx        int
+	mrpExclGstIdx int
+	qtyIdx        int
+}
+
+func detectColumns(allRows [][]string) *colLayout {
+	// Look in first 3 rows for a header-like row
+	for i := 0; i < len(allRows) && i < 3; i++ {
+		row := allRows[i]
+		layout := &colLayout{headerRow: i, itemIdx: -1, codeIdx: -1, mrpIdx: -1, mrpExclGstIdx: -1, qtyIdx: -1}
+
+		for j, cell := range row {
+			upper := strings.ToUpper(strings.TrimSpace(cell))
+			switch {
+			case strings.Contains(upper, "ITEM") || strings.Contains(upper, "ITEAM"):
+				layout.itemIdx = j
+			case upper == "CODE":
+				layout.codeIdx = j
+			// "MRP EXCLUDING GST", "NEW MRP EXCLUDING GST", "MRP EXCLUSING GST" (typo)
+			case strings.Contains(upper, "MRP") && strings.Contains(upper, "EXCL"):
+				if layout.mrpExclGstIdx < 0 { // first occurrence wins
+					layout.mrpExclGstIdx = j
+				}
+			case strings.HasPrefix(upper, "MRP") && !strings.Contains(upper, "EXCL"):
+				if layout.mrpIdx < 0 { // first occurrence wins — prevents last-col "MRP" override
+					layout.mrpIdx = j
+				}
+			case strings.Contains(upper, "MRP") && !strings.Contains(upper, "EXCL") && !strings.HasPrefix(upper, "MRP"):
+				// e.g. "Mrp" not starting with MRP after uppercasing — already covered above
+				if layout.mrpIdx < 0 {
+					layout.mrpIdx = j
+				}
+			case upper == "QTY":
+				layout.qtyIdx = j
+			}
+		}
+
+		// Need at least code + (mrp or mrpExclGst)
+		if layout.codeIdx >= 0 && (layout.mrpIdx >= 0 || layout.mrpExclGstIdx >= 0) {
+			// If item col not found, guess it's next to code (DYBL MTRL pattern: SL, Code, Items, Qty, Mrp)
+			if layout.itemIdx < 0 {
+				// Try column 2 for items in DYBL MTRL layout
+				if layout.codeIdx == 1 {
+					layout.itemIdx = 2
+				} else {
+					layout.itemIdx = 1
+				}
+			}
+			if layout.qtyIdx < 0 {
+				// Qty is typically the last column
+				layout.qtyIdx = len(row) - 1
+				if layout.qtyIdx == layout.mrpIdx {
+					layout.qtyIdx = -1 // no separate qty column
+				}
+			}
+			return layout
+		}
+	}
+	return nil
+}
+
+func safeCol(row []string, idx int) string {
+	if idx < 0 || idx >= len(row) {
+		return ""
+	}
+	return strings.TrimSpace(row[idx])
+}
+
+func parseFloat(s string) float64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	// strip thousands separator so "1,775" parses as 1775, not 1
+	s = strings.ReplaceAll(s, ",", "")
+	var v float64
+	fmt.Sscanf(s, "%f", &v)
+	return v
+}
+
+func cleanItemName(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
+	}
+	// Title case the first letter, keep rest as-is
+	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+// ── Import one category (runs inside a transaction) ──────────
+
+func importCategoryTx(
+	tx *sql.Tx,
+	catName string,
+	rows []XlsxRow,
+	warehouseID uuid.UUID,
+	catCache map[string]uuid.UUID,
+	prodCache map[string]uuid.UUID,
+	varCache map[string]uuid.UUID,
+) (*CategoryResult, error) {
+	if len(rows) == 0 {
+		return &CategoryResult{Name: catName}, nil
+	}
+
+	// 1. Get or create category (cached)
+	catID, err := getOrCreateCategoryTx(tx, catName, catCache)
+	if err != nil {
+		return nil, err
+	}
+
+	// 2. Aggregate: (item_name + code + mrp) → sum of qty
+	type variantKey struct {
+		itemName string
+		code     int
+		mrp      float64
+	}
+	variantQty := make(map[variantKey]float64)
+
+	for _, r := range rows {
+		k := variantKey{itemName: r.ItemName, code: r.Code, mrp: r.MRP}
+		variantQty[k] += r.Qty
+	}
+
+	// 3. Group by product
+	type variantData struct {
+		code int
+		mrp  float64
+		qty  float64
+	}
+	productVariants := make(map[string][]variantData)
+	for k, qty := range variantQty {
+		productVariants[k.itemName] = append(productVariants[k.itemName], variantData{
+			code: k.code, mrp: k.mrp, qty: qty,
+		})
+	}
+
+	cr := &CategoryResult{Name: catName}
+
+	for productName, variants := range productVariants {
+		productID, err := getOrCreateProductTx(tx, productName, catID, prodCache)
+		if err != nil {
+			return nil, fmt.Errorf("product %s: %w", productName, err)
+		}
+		cr.Products++
+
+		for _, v := range variants {
+			variantID, created, err := getOrCreateVariantTx(tx, productID, productName, catName, v.code, v.mrp, varCache)
+			if err != nil {
+				return nil, fmt.Errorf("variant %s code %d: %w", productName, v.code, err)
+			}
+			if created {
+				cr.Variants++
+			}
+
+			qty := math.Round(v.qty*100) / 100
+			if err := upsertStockTx(tx, variantID, warehouseID, qty); err != nil {
+				return nil, fmt.Errorf("stock for code %d: %w", v.code, err)
+			}
+			cr.TotalQty += qty
+		}
+	}
+
+	// Update category product count
+	if _, err := tx.Exec(
+		`UPDATE categories SET products_count = (
+			SELECT COUNT(*) FROM products WHERE category_id = $1
+		 ) WHERE id = $1`, catID,
+	); err != nil {
+		return nil, err
+	}
+
+	return cr, nil
+}
+
+// ── RepriceFolderToMRP ────────────────────────────────────────────────────────
+//
+// Re-reads every .xlsx in folderPath and updates variants.price to the
+// GST-inclusive MRP and variants.cost_price to the excl-GST base price.
+// Uses a single bulk UPDATE via a temp table instead of one query per row.
+func (s *Store) RepriceFolderToMRP(folderPath string) (int, error) {
+	files, err := filepath.Glob(filepath.Join(folderPath, "*.xlsx"))
+	if err != nil || len(files) == 0 {
+		return 0, fmt.Errorf("no xlsx files found in %s", folderPath)
+	}
+
+	// 1. Parse all files into a flat slice.
+	type repriceRow struct {
+		code      int
+		itemName  string
+		catName   string
+		mrp       float64
+		costPrice float64
+	}
+	var data []repriceRow
+
+	for _, file := range files {
+		catName := categoryNameFromFile(file)
+		rows, err := parseXlsx(file, catName)
+		if err != nil {
+			return 0, fmt.Errorf("parse %s: %w", filepath.Base(file), err)
+		}
+		for _, r := range rows {
+			if r.MRP <= 0 {
+				continue
+			}
+			costP := r.CostPrice
+			if costP <= 0 {
+				costP = r.MRP
+			}
+			data = append(data, repriceRow{
+				code:      r.Code,
+				itemName:  r.ItemName,
+				catName:   catName,
+				mrp:       r.MRP,
+				costPrice: costP,
+			})
+		}
+	}
+	if len(data) == 0 {
+		return 0, nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	// 2. Create a temporary staging table.
+	if _, err := tx.Exec(`
+		CREATE TEMP TABLE _reprice_staging (
+			variant_code  INT,
+			product_name  TEXT,
+			cat_name      TEXT,
+			mrp           NUMERIC,
+			cost_price    NUMERIC
+		) ON COMMIT DROP
+	`); err != nil {
+		return 0, fmt.Errorf("create temp table: %w", err)
+	}
+
+	// 3. Bulk-insert all rows into the staging table.
+	var sb strings.Builder
+	sb.WriteString("INSERT INTO _reprice_staging (variant_code, product_name, cat_name, mrp, cost_price) VALUES ")
+	args := make([]interface{}, 0, len(data)*5)
+	for i, d := range data {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		base := i * 5
+		fmt.Fprintf(&sb, "($%d, $%d, $%d, $%d, $%d)", base+1, base+2, base+3, base+4, base+5)
+		args = append(args, d.code, d.itemName, d.catName, d.mrp, d.costPrice)
+	}
+	if _, err := tx.Exec(sb.String(), args...); err != nil {
+		return 0, fmt.Errorf("bulk insert staging: %w", err)
+	}
+
+	// 4. Single UPDATE joining through staging → products → categories.
+	res, err := tx.Exec(`
+		UPDATE variants v
+		SET price      = s.mrp,
+		    cost_price = s.cost_price,
+		    updated_at = NOW()
+		FROM _reprice_staging s
+		JOIN products   p ON LOWER(p.name) = LOWER(s.product_name)
+		JOIN categories c ON c.id = p.category_id AND LOWER(c.name) = LOWER(s.cat_name)
+		WHERE v.product_id   = p.id
+		  AND v.variant_code = s.variant_code
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("bulk update: %w", err)
+	}
+
+	n, _ := res.RowsAffected()
+	return int(n), tx.Commit()
+}
+
+// ── DB helpers ───────────────────────────────────────────────
+
+// resolveBranchAndWarehouse:
+//   - If a branch with the given name exists → find its first warehouse
+//   - If neither exists → create both with the same name
+func (s *Store) resolveBranchAndWarehouse(branchName string) (uuid.UUID, uuid.UUID, error) {
+	var branchID, warehouseID uuid.UUID
+
+	// Try to find existing branch
+	err := s.db.QueryRow(
+		`SELECT id FROM branches WHERE LOWER(name) = LOWER($1)`, branchName,
+	).Scan(&branchID)
+
+	if err == nil {
+		// Branch exists → find its warehouse
+		err = s.db.QueryRow(
+			`SELECT id FROM warehouses WHERE branch_id = $1 ORDER BY created_at LIMIT 1`,
+			branchID,
+		).Scan(&warehouseID)
+		if err == nil {
+			return branchID, warehouseID, nil
+		}
+		if err != sql.ErrNoRows {
+			return branchID, warehouseID, err
+		}
+		// Branch exists but no warehouse → create warehouse with same name
+		warehouseID = uuid.New()
+		_, err = s.db.Exec(
+			`INSERT INTO warehouses (id, name, branch_id, type) VALUES ($1, $2, $3, 'STORE')`,
+			warehouseID, branchName, branchID,
+		)
+		return branchID, warehouseID, err
+	}
+	if err != sql.ErrNoRows {
+		return branchID, warehouseID, err
+	}
+
+	// Branch doesn't exist → create both
+	branchID = uuid.New()
+	_, err = s.db.Exec(`INSERT INTO branches (id, name) VALUES ($1, $2)`, branchID, branchName)
+	if err != nil {
+		return branchID, warehouseID, err
+	}
+
+	warehouseID = uuid.New()
+	_, err = s.db.Exec(
+		`INSERT INTO warehouses (id, name, branch_id, type) VALUES ($1, $2, $3, 'STORE')`,
+		warehouseID, branchName, branchID,
+	)
+	return branchID, warehouseID, err
+}
+
+// ── Transaction-based DB helpers with in-memory caching ──────
+
+// generateSKU creates a unique SKU like "SAR-5217-a3f2"
+func generateSKU(catName string, code int) string {
+	prefix := strings.ToUpper(catName)
+	if len(prefix) > 3 {
+		prefix = prefix[:3]
+	}
+	prefix = strings.ReplaceAll(prefix, " ", "")
+	short := uuid.New().String()[:4]
+	return fmt.Sprintf("%s-%d-%s", prefix, code, short)
+}
+
+// generateBarcode creates a unique 13-digit EAN-like barcode
+func generateBarcode() string {
+	u := uuid.New()
+	// Take first 12 hex chars, convert to digits
+	hex := strings.ReplaceAll(u.String(), "-", "")[:12]
+	var digits []byte
+	for _, c := range hex {
+		if c >= '0' && c <= '9' {
+			digits = append(digits, byte(c))
+		} else {
+			// a=1, b=2, ..., f=6
+			digits = append(digits, byte('0'+c-'a'+1))
+		}
+	}
+	// Pad to 12 if needed, then add check digit
+	for len(digits) < 12 {
+		digits = append(digits, '0')
+	}
+	sum := 0
+	for i, d := range digits[:12] {
+		v := int(d - '0')
+		if i%2 == 0 {
+			sum += v
+		} else {
+			sum += v * 3
+		}
+	}
+	check := (10 - sum%10) % 10
+	return string(digits[:12]) + fmt.Sprintf("%d", check)
+}
+
+func getOrCreateCategoryTx(tx *sql.Tx, name string, cache map[string]uuid.UUID) (uuid.UUID, error) {
+	key := strings.ToLower(name)
+	if id, ok := cache[key]; ok {
+		return id, nil
+	}
+	var id uuid.UUID
+	err := tx.QueryRow(`SELECT id FROM categories WHERE LOWER(name) = LOWER($1)`, name).Scan(&id)
+	if err == nil {
+		cache[key] = id
+		return id, nil
+	}
+	if err != sql.ErrNoRows {
+		return id, err
+	}
+	id = uuid.New()
+	_, err = tx.Exec(`INSERT INTO categories (id, name, is_active) VALUES ($1, $2, true)`, id, name)
+	if err != nil {
+		return id, err
+	}
+	cache[key] = id
+	return id, nil
+}
+
+func getOrCreateProductTx(tx *sql.Tx, name string, categoryID uuid.UUID, cache map[string]uuid.UUID) (uuid.UUID, error) {
+	key := categoryID.String() + "|" + strings.ToLower(name)
+	if id, ok := cache[key]; ok {
+		return id, nil
+	}
+	var id uuid.UUID
+	err := tx.QueryRow(
+		`SELECT id FROM products WHERE LOWER(name) = LOWER($1) AND category_id = $2`,
+		name, categoryID,
+	).Scan(&id)
+	if err == nil {
+		cache[key] = id
+		return id, nil
+	}
+	if err != sql.ErrNoRows {
+		return id, err
+	}
+	id = uuid.New()
+	_, err = tx.Exec(
+		`INSERT INTO products (id, name, category_id, is_active, is_web_visible, uom)
+		 VALUES ($1, $2, $3, true, true, 'Unit')`,
+		id, name, categoryID,
+	)
+	if err != nil {
+		return id, err
+	}
+	cache[key] = id
+	return id, nil
+}
+
+func getOrCreateVariantTx(tx *sql.Tx, productID uuid.UUID, productName, catName string, code int, price float64, cache map[string]uuid.UUID) (uuid.UUID, bool, error) {
+	key := fmt.Sprintf("%s|%d|%.2f", productID, code, price)
+	if id, ok := cache[key]; ok {
+		return id, false, nil
+	}
+	var id uuid.UUID
+	err := tx.QueryRow(
+		`SELECT id FROM variants WHERE product_id = $1 AND variant_code = $2 AND price = $3`,
+		productID, code, price,
+	).Scan(&id)
+	if err == nil {
+		cache[key] = id
+		return id, false, nil
+	}
+	if err != sql.ErrNoRows {
+		return id, false, err
+	}
+
+	sku := generateSKU(catName, code)
+	barcode := generateBarcode()
+	variantName := fmt.Sprintf("%s - %d", productName, code)
+
+	id = uuid.New()
+	_, err = tx.Exec(
+		`INSERT INTO variants (id, product_id, variant_code, name, sku, barcode, price, cost_price, is_active)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $7, true)`,
+		id, productID, code, variantName, sku, barcode, price,
+	)
+	if err != nil {
+		return id, false, err
+	}
+	cache[key] = id
+	return id, true, nil
+}
+
+func upsertStockTx(tx *sql.Tx, variantID, warehouseID uuid.UUID, qty float64) error {
+	_, err := tx.Exec(
+		`INSERT INTO stocks (id, variant_id, warehouse_id, quantity, stock_type)
+		 VALUES (uuid_generate_v4(), $1, $2, $3, 'PRODUCT')
+		 ON CONFLICT (variant_id, warehouse_id)
+		 DO UPDATE SET quantity = stocks.quantity + $3, updated_at = NOW()`,
+		variantID, warehouseID, qty,
+	)
+	return err
+}
+
+// ── Sales Invoice Migration ───────────────────────────────────
+
+const salesMigXLSXPath = "internal/migration/SalesMigration/Sales Report List.xlsx"
+
+// SalesMigrationResult is returned after running the sales import.
+type SalesMigrationResult struct {
+	TotalGroups int      `json:"total_groups"`
+	Created     int      `json:"created"`
+	Skipped     int      `json:"skipped"`
+	Errored     int      `json:"errored"`
+	Errors      []string `json:"errors,omitempty"`
+}
+
+// salesInvGroup holds one logical invoice (one or more item rows + one payment row).
+type salesInvGroup struct {
+	InvoiceNumber     string
+	CustomerName      string
+	DateStr           string
+	Items             []salesMigItem
+	RoundOff          float64
+	SalesReturnAdjust float64
+	AdvAdjust         float64
+	Cheque            float64
+	Online            float64
+	Cash              float64
+	DebitCard         float64
+	CreditCard        float64
+}
+
+// salesMigItem is one line item from the Excel.
+type salesMigItem struct {
+	Description string
+	Rate        float64
+	Qty         float64
+	Taxable     float64
+	TaxRate     float64
+	CGST        float64
+	SGST        float64
+	IGST        float64
+	InvVal      float64
+}
+
+// ImportSales parses the sales migration Excel and inserts invoice records.
+// branchName must match an existing branch in the DB; its first warehouse is used.
+// userID (from JWT) becomes created_by on all inserted rows.
+func (s *Store) ImportSales(userID, branchName string) (*SalesMigrationResult, error) {
+	// Resolve branch
+	var branchID string
+	if err := s.db.QueryRow(
+		`SELECT id FROM branches WHERE LOWER(TRIM(name)) = LOWER($1) LIMIT 1`, branchName,
+	).Scan(&branchID); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("branch %q not found", branchName)
+		}
+		return nil, fmt.Errorf("lookup branch: %w", err)
+	}
+
+	// Resolve warehouse
+	var warehouseID string
+	if err := s.db.QueryRow(
+		`SELECT id FROM warehouses WHERE branch_id = $1 ORDER BY created_at LIMIT 1`, branchID,
+	).Scan(&warehouseID); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("no warehouse found for branch %q", branchName)
+		}
+		return nil, fmt.Errorf("lookup warehouse: %w", err)
+	}
+
+	groups, err := parseSalesXLSX(salesMigXLSXPath)
+	if err != nil {
+		return nil, fmt.Errorf("parse xlsx: %w", err)
+	}
+
+	result := &SalesMigrationResult{TotalGroups: len(groups)}
+	for _, g := range groups {
+		imported, err := s.importOneInvoice(g, userID, branchID, warehouseID)
+		if err != nil {
+			result.Errored++
+			result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", g.InvoiceNumber, err))
+		} else if imported {
+			result.Created++
+		} else {
+			result.Skipped++
+		}
+	}
+	return result, nil
+}
+
+func (s *Store) importOneInvoice(g salesInvGroup, userID, branchID, warehouseID string) (created bool, err error) {
+	// Idempotency check
+	var exists bool
+	if err := s.db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM sales_invoices WHERE invoice_number = $1)`,
+		g.InvoiceNumber,
+	).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check exists: %w", err)
+	}
+	if exists {
+		return false, nil
+	}
+
+	invoiceDate, err := parseSalesDate(g.DateStr)
+	if err != nil {
+		return false, fmt.Errorf("parse date %q: %w", g.DateStr, err)
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. Find or create customer by name
+	customerName := strings.TrimSpace(g.CustomerName)
+	if customerName == "" {
+		customerName = "Walk-in Customer"
+	}
+	var customerID string
+	err = tx.QueryRow(
+		`SELECT id FROM customers WHERE LOWER(TRIM(name)) = LOWER($1) LIMIT 1`,
+		customerName,
+	).Scan(&customerID)
+	if err == sql.ErrNoRows {
+		var maxCode sql.NullString
+		tx.QueryRow(`SELECT MAX(customer_code) FROM customers WHERE customer_code LIKE 'CUS%'`).Scan(&maxCode)
+		next := 1
+		if maxCode.Valid && len(maxCode.String) > 3 {
+			fmt.Sscanf(maxCode.String[3:], "%d", &next)
+			next++
+		}
+		code := fmt.Sprintf("CUS%04d", next)
+		if err = tx.QueryRow(
+			`INSERT INTO customers (customer_code, name, phone, email)
+			 VALUES ($1, $2, NULL, NULL) RETURNING id`,
+			code, customerName,
+		).Scan(&customerID); err != nil {
+			return false, fmt.Errorf("create customer: %w", err)
+		}
+	} else if err != nil {
+		return false, fmt.Errorf("find customer: %w", err)
+	}
+
+	// 2. Compute totals
+	var subTotal, gstTotal, netTotal float64
+	for _, item := range g.Items {
+		subTotal += item.Taxable
+		if item.IGST > 0 {
+			gstTotal += item.IGST
+		} else {
+			gstTotal += item.CGST + item.SGST
+		}
+		netTotal += item.InvVal
+	}
+	subTotal = salesRound2(subTotal)
+	gstTotal = salesRound2(gstTotal)
+	netTotal = salesRound2(netTotal)
+	roundOff := g.RoundOff
+	netAmount := salesRound2(netTotal + roundOff)
+
+	// paid = all cash receipts + return / advance adjustments
+	paidAmount := salesRound2(g.Cheque + g.Online + g.Cash + g.DebitCard + g.CreditCard +
+		g.SalesReturnAdjust + g.AdvAdjust)
+	paymentStatus := "UNPAID"
+	if paidAmount >= netAmount {
+		paymentStatus = "PAID"
+	} else if paidAmount > 0 {
+		paymentStatus = "PARTIAL"
+	}
+
+	// 3. Create sales_order
+	soNumber := "MIG-" + g.InvoiceNumber
+	var salesOrderID string
+	if err = tx.QueryRow(`
+		INSERT INTO sales_orders
+			(so_number, channel, branch_id, customer_id, salesperson_id,
+			 warehouse_id, created_by, order_date,
+			 subtotal, tax_total, discount_total, bill_discount, grand_total,
+			 status, payment_status, notes)
+		VALUES ($1,'STORE',$2,$3,NULL,$4,$5,$6,$7,$8,0,0,$9,'CONFIRMED',$10,'Migrated from POS')
+		RETURNING id`,
+		soNumber, branchID, customerID, warehouseID,
+		userID, invoiceDate,
+		subTotal, gstTotal, netAmount, paymentStatus,
+	).Scan(&salesOrderID); err != nil {
+		return false, fmt.Errorf("create sales order: %w", err)
+	}
+
+	// 4. Create sales_invoice
+	var salesInvoiceID string
+	if err = tx.QueryRow(`
+		INSERT INTO sales_invoices
+			(sales_order_id, customer_id, warehouse_id, channel, branch_id,
+			 invoice_number, invoice_date,
+			 sub_amount, discount_amount, bill_discount, gst_amount, round_off,
+			 net_amount, paid_amount, status, created_by)
+		VALUES ($1,$2,$3,'STORE',$4,$5,$6,$7,0,0,$8,$9,$10,$11,$12,$13)
+		RETURNING id`,
+		salesOrderID, customerID, warehouseID, branchID,
+		g.InvoiceNumber, invoiceDate,
+		subTotal, gstTotal, roundOff,
+		netAmount, paidAmount, paymentStatus, userID,
+	).Scan(&salesInvoiceID); err != nil {
+		return false, fmt.Errorf("create sales invoice: %w", err)
+	}
+
+	// 5. Create sales_order_items + sales_invoice_items (no variant — migrated data)
+	for _, item := range g.Items {
+		taxAmt := item.CGST + item.SGST
+		if item.IGST > 0 {
+			taxAmt = item.IGST
+		}
+		if _, err = tx.Exec(`
+			INSERT INTO sales_order_items
+				(sales_order_id, variant_id, item_description,
+				 quantity, unit_price, discount, tax_percent, tax_amount, total_price)
+			VALUES ($1, NULL, $2, $3, $4, 0, $5, $6, $7)`,
+			salesOrderID, item.Description, item.Qty, item.Rate,
+			item.TaxRate, salesRound2(taxAmt), salesRound2(item.InvVal),
+		); err != nil {
+			return false, fmt.Errorf("create order item: %w", err)
+		}
+		if _, err = tx.Exec(`
+			INSERT INTO sales_invoice_items
+				(sales_invoice_id, variant_id, item_description,
+				 quantity, unit_price, discount, tax_percent, tax_amount, total_price)
+			VALUES ($1, NULL, $2, $3, $4, 0, $5, $6, $7)`,
+			salesInvoiceID, item.Description, item.Qty, item.Rate,
+			item.TaxRate, salesRound2(taxAmt), salesRound2(item.InvVal),
+		); err != nil {
+			return false, fmt.Errorf("create invoice item: %w", err)
+		}
+	}
+
+	// 6. Create sales_payments
+	type pmEntry struct {
+		method string
+		amount float64
+	}
+	pmList := []pmEntry{
+		{"CASH", g.Cash},
+		{"ONLINE", g.Online},
+		{"CHEQUE", g.Cheque},
+		{"DEBITCARD", g.DebitCard},
+		{"CREDITCARD", g.CreditCard},
+		{"RETURN_ADJUST", g.SalesReturnAdjust},
+		{"ADV_ADJUST", g.AdvAdjust},
+	}
+	for _, p := range pmList {
+		if p.amount <= 0 {
+			continue
+		}
+		if _, err = tx.Exec(`
+			INSERT INTO sales_payments (sales_invoice_id, amount, payment_method, reference, paid_at)
+			VALUES ($1, $2, $3, 'Migrated', $4)`,
+			salesInvoiceID, salesRound2(p.amount), p.method, invoiceDate,
+		); err != nil {
+			return false, fmt.Errorf("create payment %s: %w", p.method, err)
+		}
+	}
+
+	// 7. Update customer total_purchases
+	if _, err = tx.Exec(
+		`UPDATE customers SET total_purchases = total_purchases + $1, updated_at = NOW() WHERE id = $2`,
+		netAmount, customerID,
+	); err != nil {
+		return false, fmt.Errorf("update customer purchases: %w", err)
+	}
+
+	if err = tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit: %w", err)
+	}
+	return true, nil
+}
+
+// parseSalesXLSX reads the Sales Report List.xlsx and groups rows into invoices.
+//
+// Column layout (0-based indices in each row slice):
+//
+//	0=SlNo, 1=CUSTOMER, 2=INVNO, 3=Date, 4=Item, 5=HSN,
+//	6=Rate, 7=Qty, 8=Taxable, 9=Tax Rate, 10=CGST, 11=SGST,
+//	12=IGST, 13=TOTAL GST, 14=INV VAL, 15=RoundOff,
+//	16=SALESRETURN ADJUST, 17=ADV ADJUST,
+//	18=Cheque, 19=Online, 20=Cash, 21=Debitcard, 22=CreditCard
+func parseSalesXLSX(path string) ([]salesInvGroup, error) {
+	f, err := excelize.OpenFile(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	sheets := f.GetSheetList()
+	if len(sheets) == 0 {
+		return nil, fmt.Errorf("no sheets found in workbook")
+	}
+
+	allRows, err := f.GetRows(sheets[0])
+	if err != nil {
+		return nil, err
+	}
+	if len(allRows) < 2 {
+		return nil, fmt.Errorf("no data rows found")
+	}
+
+	var groups []salesInvGroup
+	var current *salesInvGroup
+
+	for i := 1; i < len(allRows); i++ { // skip header at index 0
+		row := allRows[i]
+		invNo := strings.TrimSpace(safeCol(row, 2))
+
+		if invNo != "" {
+			// Invoice item row
+			if current == nil || current.InvoiceNumber != invNo {
+				// New invoice starts; carry forward any unfinished group
+				if current != nil && len(current.Items) > 0 {
+					// Missing payment row — store what we have
+					groups = append(groups, *current)
+				}
+				current = &salesInvGroup{
+					InvoiceNumber: invNo,
+					CustomerName:  strings.TrimSpace(safeCol(row, 1)),
+					DateStr:       strings.TrimSpace(safeCol(row, 3)),
+				}
+			}
+			current.Items = append(current.Items, salesMigItem{
+				Description: strings.TrimSpace(safeCol(row, 4)),
+				Rate:        parseFloat(safeCol(row, 6)),
+				Qty:         parseFloat(safeCol(row, 7)),
+				Taxable:     parseFloat(safeCol(row, 8)),
+				TaxRate:     parseFloat(safeCol(row, 9)),
+				CGST:        parseFloat(safeCol(row, 10)),
+				SGST:        parseFloat(safeCol(row, 11)),
+				IGST:        parseFloat(safeCol(row, 12)),
+				InvVal:      parseFloat(safeCol(row, 14)),
+			})
+		} else {
+			// Payment row (INVNO is empty)
+			if current != nil && len(current.Items) > 0 {
+				current.RoundOff = parseFloat(safeCol(row, 15))
+				current.SalesReturnAdjust = parseFloat(safeCol(row, 16))
+				current.AdvAdjust = parseFloat(safeCol(row, 17))
+				current.Cheque = parseFloat(safeCol(row, 18))
+				current.Online = parseFloat(safeCol(row, 19))
+				current.Cash = parseFloat(safeCol(row, 20))
+				current.DebitCard = parseFloat(safeCol(row, 21))
+				current.CreditCard = parseFloat(safeCol(row, 22))
+				groups = append(groups, *current)
+				current = nil
+			}
+			// else: orphan row (e.g. the totals summary at the end) — skip
+		}
+	}
+
+	return groups, nil
+}
+
+// parseSalesDate tries several common date layouts.
+func parseSalesDate(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	for _, layout := range []string{"02/01/2006", "2/1/2006", "2006-01-02", "01/02/2006"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		}
+	}
+	// Last-resort: Excel date serial number (days since 1899-12-30)
+	if n := parseFloat(s); n > 100 {
+		t := time.Date(1899, 12, 30, 0, 0, 0, 0, time.UTC).Add(
+			time.Duration(int(n)) * 24 * time.Hour)
+		return t, nil
+	}
+	return time.Time{}, fmt.Errorf("unrecognised date %q", s)
+}
+
+func salesRound2(v float64) float64 {
+	return math.Round(v*100) / 100
+}
+
+// ── Vyttila Stock Import ──────────────────────────────────────────────────────
+//
+// Reads a multi-sheet xlsx (one sheet = one category).
+// Columns (0-based): 0=SL NO, 1=CODE, 2=SP (tax-incl), 3=CP, 4=QTY, 7=ITEM DESCRIPTION
+// SP is tax-inclusive; we strip GST before storing as variants.price.
+// CP is stored as cost_price without modification.
+
+type vyttilaVariantRow struct {
+	itemName  string
+	code      int
+	price     float64 // SP with GST (stored as variants.price)
+	costPrice float64 // SP without GST (stored as variants.cost_price)
+	qty       float64
+}
+
+type vyttilaSheet struct {
+	catName           string
+	variantsByProduct map[string][]vyttilaVariantRow
+}
+
+// stripGST removes GST from a tax-inclusive selling price using the billing
+// rule: ≤2500 exclusive → 5%, >2500 exclusive → 18%.
+func stripGST(sp float64) float64 {
+	if sp <= 0 {
+		return 0
+	}
+	priceAt5 := sp / 1.05
+	if priceAt5 <= 2500 {
+		return math.Round(priceAt5*100) / 100
+	}
+	return math.Round(sp/1.18*100) / 100
+}
+
+// parseVyttilaXlsx parses each sheet of the uploaded file into structured data.
+func parseVyttilaXlsx(fileBytes []byte) ([]vyttilaSheet, error) {
+	f, err := excelize.OpenReader(bytes.NewReader(fileBytes))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var sheets []vyttilaSheet
+
+	for _, sheetName := range f.GetSheetList() {
+		allRows, err := f.GetRows(sheetName)
+		if err != nil {
+			continue
+		}
+
+		// Find header row: the row where column B (index 1) == "CODE"
+		headerRow := -1
+		for i, row := range allRows {
+			if i >= 3 {
+				break
+			}
+			if len(row) > 1 && strings.ToUpper(strings.TrimSpace(row[1])) == "CODE" {
+				headerRow = i
+				break
+			}
+		}
+		if headerRow < 0 {
+			continue
+		}
+
+		sheet := vyttilaSheet{
+			catName:           strings.TrimSpace(sheetName),
+			variantsByProduct: make(map[string][]vyttilaVariantRow),
+		}
+
+		// key = "CODE|ITEM" to aggregate qty for exact duplicates
+		type varKey struct {
+			code int
+			item string
+		}
+		seen := make(map[varKey]*vyttilaVariantRow)
+
+		for i, row := range allRows {
+			if i <= headerRow {
+				continue
+			}
+			if len(row) < 8 {
+				continue
+			}
+
+			codeStr := strings.TrimSpace(safeCol(row, 1))
+			if codeStr == "" {
+				continue
+			}
+			code := int(parseFloat(codeStr))
+			if code == 0 {
+				continue
+			}
+
+			// Column layout (WITH_GST format):
+			// col1=CODE, col2=SP(with GST), col3=SP(without GST),
+			// col4=GST%, col5=GST amount, col6=CP, col7=QTY, col11=ITEM DESCRIPTION
+			priceIncl := parseFloat(safeCol(row, 2)) // SP with GST → variants.price
+			cp := parseFloat(safeCol(row, 6))        // CP → variants.cost_price
+			priceExcl := parseFloat(safeCol(row, 3)) // SP without GST — fallback if CP empty
+			qty := parseFloat(safeCol(row, 7))
+			itemDesc := strings.ToUpper(strings.TrimSpace(safeCol(row, 11)))
+			if itemDesc == "" {
+				itemDesc = strings.ToUpper(sheet.catName)
+			}
+
+			if priceIncl <= 0 {
+				// fallback: if WITH GST cell is empty, use excl-GST value
+				priceIncl = priceExcl
+			}
+			costPrice := cp
+			if costPrice <= 0 {
+				costPrice = priceExcl // fallback to SP excl. GST when CP is blank
+			}
+			if costPrice <= 0 {
+				costPrice = priceIncl
+			}
+
+			k := varKey{code: code, item: itemDesc}
+			if existing, ok := seen[k]; ok {
+				existing.qty += qty
+				continue
+			}
+
+			v := &vyttilaVariantRow{
+				itemName:  itemDesc,
+				code:      code,
+				price:     priceIncl,
+				costPrice: costPrice,
+				qty:       qty,
+			}
+			seen[k] = v
+			sheet.variantsByProduct[itemDesc] = append(sheet.variantsByProduct[itemDesc], *v)
+		}
+
+		sheets = append(sheets, sheet)
+	}
+
+	return sheets, nil
+}
+
+// ImportVyttilaStock processes the uploaded xlsx and migrates stock into the
+// DEFAB Vyttila branch/warehouse (created if they don't exist).
+// ImportVyttilaStock processes the uploaded xlsx and migrates stock into the
+// target branch/warehouse (created if they don't exist) using the same bulk
+// multi-row INSERT strategy as ImportFolder to avoid statement timeouts.
+func (s *Store) ImportVyttilaStock(fileBytes []byte, branchName string, dryRun bool) (*ImportResult, error) {
+	// 1. Parse xlsx — all sheets, no DB hits yet
+	sheets, err := parseVyttilaXlsx(fileBytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse xlsx: %w", err)
+	}
+
+	// 2. Flatten into deduplicated bulk structures
+	type vKey struct {
+		catName  string
+		itemName string
+		code     int
+	}
+	type vData struct {
+		price     float64
+		costPrice float64
+		qty       float64
+	}
+	type pKey struct {
+		catName  string
+		itemName string
+	}
+
+	catNames := make(map[string]bool)
+	prodKeys := make(map[pKey]bool)
+	variantMap := make(map[vKey]*vData)
+
+	for _, sh := range sheets {
+		catNames[sh.catName] = true
+		for productName, variants := range sh.variantsByProduct {
+			prodKeys[pKey{catName: sh.catName, itemName: productName}] = true
+			for _, v := range variants {
+				k := vKey{catName: sh.catName, itemName: productName, code: v.code}
+				if existing, ok := variantMap[k]; ok {
+					existing.qty += v.qty
+				} else {
+					variantMap[k] = &vData{price: v.price, costPrice: v.costPrice, qty: v.qty}
+				}
+			}
+		}
+	}
+
+	// 3. Dry-run: return counts without DB writes
+	if dryRun {
+		result := &ImportResult{}
+		catVariants := make(map[string]int)
+		catProds := make(map[string]map[string]bool)
+		catQty := make(map[string]float64)
+		for k, vd := range variantMap {
+			catVariants[k.catName]++
+			catQty[k.catName] += vd.qty
+			if catProds[k.catName] == nil {
+				catProds[k.catName] = make(map[string]bool)
+			}
+			catProds[k.catName][k.itemName] = true
+		}
+		for catName := range catNames {
+			cr := CategoryResult{
+				Name:     catName,
+				Products: len(catProds[catName]),
+				Variants: catVariants[catName],
+				TotalQty: catQty[catName],
+			}
+			result.CategoriesCreated++
+			result.ProductsCreated += cr.Products
+			result.VariantsCreated += cr.Variants
+			result.StockRowsCreated += cr.Variants
+			result.TotalQtyImported += cr.TotalQty
+			result.PerCategory = append(result.PerCategory, cr)
+		}
+		return result, nil
+	}
+
+	// 4. Resolve/create branch + warehouse
+	_, warehouseID, err := s.resolveBranchAndWarehouse(branchName)
+	if err != nil {
+		return nil, fmt.Errorf("branch/warehouse: %w", err)
+	}
+
+	// 5. Single transaction with bulk operations
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// ── Bulk upsert categories ──
+	catIDs := make(map[string]uuid.UUID)
+	for catName := range catNames {
+		id := uuid.New()
+		if err := tx.QueryRow(
+			`INSERT INTO categories (id, name, is_active) VALUES ($1, $2, true)
+			 ON CONFLICT (name) DO UPDATE SET name = categories.name
+			 RETURNING id`,
+			id, catName,
+		).Scan(&id); err != nil {
+			return nil, fmt.Errorf("category %s: %w", catName, err)
+		}
+		catIDs[catName] = id
+	}
+
+	// ── Bulk insert products (batches of 500) ──
+	type prodInfo struct {
+		catName  string
+		itemName string
+		id       uuid.UUID
+		catID    uuid.UUID
+	}
+	var allProds []prodInfo
+	for pk := range prodKeys {
+		allProds = append(allProds, prodInfo{
+			catName:  pk.catName,
+			itemName: pk.itemName,
+			id:       uuid.New(),
+			catID:    catIDs[pk.catName],
+		})
+	}
+
+	const prodBatchSize = 500
+	for i := 0; i < len(allProds); i += prodBatchSize {
+		end := i + prodBatchSize
+		if end > len(allProds) {
+			end = len(allProds)
+		}
+		batch := allProds[i:end]
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO products (id, name, category_id, is_active, is_web_visible, uom) VALUES `)
+		args := make([]interface{}, 0, len(batch)*3)
+		for j, p := range batch {
+			if j > 0 {
+				sb.WriteString(", ")
+			}
+			base := j * 3
+			fmt.Fprintf(&sb, "($%d, $%d, $%d, true, true, 'Unit')", base+1, base+2, base+3)
+			args = append(args, p.id, p.itemName, p.catID)
+		}
+		sb.WriteString(` ON CONFLICT DO NOTHING`)
+		if _, err := tx.Exec(sb.String(), args...); err != nil {
+			return nil, fmt.Errorf("bulk product insert: %w", err)
+		}
+	}
+
+	// ── Bulk SELECT all product IDs ──
+	// We look up by category_id IN (...) — covers both newly inserted and pre-existing products.
+	// We also do a name-based lookup as fallback for any products that conflicted on a different catID.
+	catNameByID := make(map[uuid.UUID]string)
+	catIDSlice := make([]interface{}, 0, len(catIDs))
+	for name, id := range catIDs {
+		catNameByID[id] = name
+		catIDSlice = append(catIDSlice, id)
+	}
+	prodIDs := make(map[string]uuid.UUID) // "catName|lowerItemName" → id
+	{
+		var sb strings.Builder
+		sb.WriteString(`SELECT id, LOWER(name), category_id FROM products WHERE category_id IN (`)
+		for i := range catIDSlice {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			fmt.Fprintf(&sb, "$%d", i+1)
+		}
+		sb.WriteString(`)`)
+		rows, err := tx.Query(sb.String(), catIDSlice...)
+		if err != nil {
+			return nil, fmt.Errorf("product lookup: %w", err)
+		}
+		for rows.Next() {
+			var id, catID uuid.UUID
+			var lowerName string
+			if err := rows.Scan(&id, &lowerName, &catID); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan product: %w", err)
+			}
+			prodIDs[catNameByID[catID]+"|"+lowerName] = id
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("product rows: %w", err)
+		}
+	}
+
+	// ── Build all variant rows ──
+	type vyttilaVarRow struct {
+		id        uuid.UUID
+		productID uuid.UUID
+		code      int
+		name      string
+		sku       string
+		barcode   string
+		price     float64
+		costPrice float64
+		qty       float64
+		catName   string
+		itemName  string
+	}
+	allVariants := make([]vyttilaVarRow, 0, len(variantMap))
+	for k, vd := range variantMap {
+		prodKey := k.catName + "|" + strings.ToLower(k.itemName)
+		productID := prodIDs[prodKey]
+		if productID == (uuid.UUID{}) {
+			return nil, fmt.Errorf("product ID not found for %q in category %q (key=%q) — check for ON CONFLICT mismatch", k.itemName, k.catName, prodKey)
+		}
+		allVariants = append(allVariants, vyttilaVarRow{
+			id:        uuid.New(),
+			productID: productID,
+			code:      k.code,
+			name:      fmt.Sprintf("%s - %d", k.itemName, k.code),
+			sku:       generateSKU(k.catName, k.code),
+			barcode:   generateBarcode(),
+			price:     vd.price,
+			costPrice: vd.costPrice,
+			qty:       math.Round(vd.qty*100) / 100,
+			catName:   k.catName,
+			itemName:  k.itemName,
+		})
+	}
+
+	// ── Bulk insert variants (batches of 500, 8 params per row) ──
+	const varBatchSize = 500
+	for i := 0; i < len(allVariants); i += varBatchSize {
+		end := i + varBatchSize
+		if end > len(allVariants) {
+			end = len(allVariants)
+		}
+		batch := allVariants[i:end]
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO variants (id, product_id, variant_code, name, sku, barcode, price, cost_price, is_active) VALUES `)
+		args := make([]interface{}, 0, len(batch)*8)
+		for j, v := range batch {
+			if j > 0 {
+				sb.WriteString(", ")
+			}
+			base := j * 8
+			fmt.Fprintf(&sb, "($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, true)",
+				base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8)
+			args = append(args, v.id, v.productID, v.code, v.name, v.sku, v.barcode, v.price, v.costPrice)
+		}
+		sb.WriteString(` ON CONFLICT DO NOTHING`)
+		if _, err := tx.Exec(sb.String(), args...); err != nil {
+			return nil, fmt.Errorf("bulk variant insert: %w", err)
+		}
+	}
+
+	// ── Bulk upsert stock (batches of 500) ──
+	const stockBatchSize = 500
+	for i := 0; i < len(allVariants); i += stockBatchSize {
+		end := i + stockBatchSize
+		if end > len(allVariants) {
+			end = len(allVariants)
+		}
+		batch := allVariants[i:end]
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO stocks (id, variant_id, warehouse_id, quantity, stock_type) VALUES `)
+		args := make([]interface{}, 0, len(batch)*3)
+		for j, v := range batch {
+			if j > 0 {
+				sb.WriteString(", ")
+			}
+			base := j * 3
+			fmt.Fprintf(&sb, "(uuid_generate_v4(), $%d, $%d, $%d, 'PRODUCT')", base+1, base+2, base+3)
+			args = append(args, v.id, warehouseID, v.qty)
+		}
+		sb.WriteString(` ON CONFLICT (variant_id, warehouse_id)
+		 DO UPDATE SET quantity = stocks.quantity + EXCLUDED.quantity, updated_at = NOW()`)
+		if _, err := tx.Exec(sb.String(), args...); err != nil {
+			return nil, fmt.Errorf("bulk stock upsert: %w", err)
+		}
+	}
+
+	// ── Update category product counts + gather results ──
+	result := &ImportResult{}
+	catVariantCount := make(map[string]int)
+	catQtyMap := make(map[string]float64)
+	catProdsMap := make(map[string]map[string]bool)
+	for _, v := range allVariants {
+		catVariantCount[v.catName]++
+		catQtyMap[v.catName] += v.qty
+		if catProdsMap[v.catName] == nil {
+			catProdsMap[v.catName] = make(map[string]bool)
+		}
+		catProdsMap[v.catName][v.itemName] = true
+	}
+	for catName, catID := range catIDs {
+		if _, err := tx.Exec(
+			`UPDATE categories SET products_count = (
+				SELECT COUNT(*) FROM products WHERE category_id = $1
+			 ) WHERE id = $1`, catID,
+		); err != nil {
+			return nil, err
+		}
+		cr := CategoryResult{
+			Name:     catName,
+			Products: len(catProdsMap[catName]),
+			Variants: catVariantCount[catName],
+			TotalQty: catQtyMap[catName],
+		}
+		result.CategoriesCreated++
+		result.ProductsCreated += cr.Products
+		result.VariantsCreated += cr.Variants
+		result.StockRowsCreated += cr.Variants
+		result.TotalQtyImported += cr.TotalQty
+		result.PerCategory = append(result.PerCategory, cr)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit: %w", err)
+	}
+
+	return result, nil
+}
+
+// BulkMapHSNCodes parses an xlsx with columns CODE and HSN CODE (header in row 1),
+// then updates variants.hsn_code for every variant whose variant_code matches each CODE.
+// Returns (codesProcessed, totalVariantsUpdated, error).
+func (s *Store) BulkMapHSNCodes(fileBytes []byte) (int, int, error) {
+	xl, err := excelize.OpenReader(bytes.NewReader(fileBytes))
+	if err != nil {
+		return 0, 0, fmt.Errorf("open xlsx: %w", err)
+	}
+	defer xl.Close()
+
+	// Parse all sheets - normally just one, but handle multiple gracefully
+	codeToHSN := make(map[string]string) // variant_code (string) ? hsn_code
+	for _, sheet := range xl.GetSheetList() {
+		rows, err := xl.GetRows(sheet)
+		if err != nil || len(rows) < 2 {
+			continue
+		}
+		// Row 0 is header (CODE, HSN CODE) - skip it
+		for _, row := range rows[1:] {
+			if len(row) < 2 {
+				continue
+			}
+			code := strings.TrimSpace(row[0])
+			hsn := strings.TrimSpace(row[1])
+			if code == "" || hsn == "" {
+				continue
+			}
+			codeToHSN[code] = hsn
+		}
+	}
+
+	if len(codeToHSN) == 0 {
+		return 0, 0, fmt.Errorf("no valid CODE/HSN rows found in file")
+	}
+
+	totalUpdated := 0
+	for code, hsn := range codeToHSN {
+		res, err := s.db.Exec(
+			`UPDATE variants SET hsn_code = $1 WHERE variant_code::text = $2`,
+			hsn, code,
+		)
+		if err != nil {
+			return 0, 0, fmt.Errorf("update variants for code %s: %w", code, err)
+		}
+		n, _ := res.RowsAffected()
+		totalUpdated += int(n)
+	}
+
+	return len(codeToHSN), totalUpdated, nil
+}
+
+// StockImportResult is the response from ImportStockToWarehouse.
+type StockImportResult struct {
+	TotalRows         int     `json:"total_rows"`
+	StockUpdated      int     `json:"stock_updated"`
+	StockCreated      int     `json:"stock_created"`
+	VariantsCreated   int     `json:"variants_created"`
+	ProductsCreated   int     `json:"products_created"`
+	CategoriesCreated int     `json:"categories_created"`
+	TotalQtyImported  float64 `json:"total_qty_imported"`
+	SkippedRows       int     `json:"skipped_rows"`
+}
+
+// stockXlsxRow holds one parsed row from the "NEED TO ADDED STOCK" xlsx.
+type stockXlsxRow struct {
+	Code     int
+	CP       float64
+	SP       float64
+	HSNCode  string
+	Qty      float64
+	ItemName string
+	Category string
+}
+
+// parseStockXlsx reads the flat single-sheet xlsx with headers:
+// CODE, CP, SP, HSN CODE, QTY, ITEM NAME, CATEGORY
+func parseStockXlsx(fileBytes []byte) ([]stockXlsxRow, error) {
+	f, err := excelize.OpenReader(bytes.NewReader(fileBytes))
+	if err != nil {
+		return nil, fmt.Errorf("the uploaded file is not a valid Excel (.xlsx) file")
+	}
+	defer f.Close()
+
+	sheets := f.GetSheetList()
+	if len(sheets) == 0 {
+		return nil, fmt.Errorf("the Excel file has no sheets")
+	}
+
+	allRows, err := f.GetRows(sheets[0])
+	if err != nil {
+		return nil, fmt.Errorf("could not read the Excel sheet: %w", err)
+	}
+	if len(allRows) == 0 {
+		return nil, fmt.Errorf("the Excel sheet is empty — no data found")
+	}
+
+	// Locate header row by scanning until we find CODE and ITEM NAME.
+	headerIdx := -1
+	colCode, colCP, colSP, colHSN, colQty, colItem, colCat := -1, -1, -1, -1, -1, -1, -1
+	var foundHeaders []string
+	for i, row := range allRows {
+		colCode, colCP, colSP, colHSN, colQty, colItem, colCat = -1, -1, -1, -1, -1, -1, -1
+		foundHeaders = foundHeaders[:0]
+		for j, cell := range row {
+			h := strings.ToUpper(strings.TrimSpace(cell))
+			if h != "" {
+				foundHeaders = append(foundHeaders, h)
+			}
+			switch h {
+			case "CODE":
+				colCode = j
+			case "CP":
+				colCP = j
+			case "SP":
+				colSP = j
+			case "HSN CODE":
+				colHSN = j
+			case "QTY":
+				colQty = j
+			case "ITEM NAME":
+				colItem = j
+			case "CATEGORY":
+				colCat = j
+			}
+		}
+		if colCode >= 0 && colItem >= 0 {
+			headerIdx = i
+			break
+		}
+	}
+
+	if headerIdx < 0 {
+		// Build a helpful message showing what was actually found.
+		var firstRowCells []string
+		if len(allRows) > 0 {
+			for _, cell := range allRows[0] {
+				if v := strings.TrimSpace(cell); v != "" {
+					firstRowCells = append(firstRowCells, v)
+				}
+			}
+		}
+		var missing []string
+		if colCode < 0 {
+			missing = append(missing, "CODE")
+		}
+		if colItem < 0 {
+			missing = append(missing, "ITEM NAME")
+		}
+		if len(firstRowCells) > 0 {
+			return nil, fmt.Errorf(
+				"missing required column(s): %s — columns found in the file: %s (check for typos or extra spaces)",
+				strings.Join(missing, ", "),
+				strings.Join(firstRowCells, ", "),
+			)
+		}
+		return nil, fmt.Errorf(
+			"missing required column(s): %s — no recognisable headers found in the file",
+			strings.Join(missing, ", "),
+		)
+	}
+
+	dataRows := allRows[headerIdx+1:]
+	if len(dataRows) == 0 {
+		return nil, fmt.Errorf("the Excel file has a header row but no data rows below it")
+	}
+
+	_ = colHSN // optional — used when present
+
+	var rows []stockXlsxRow
+	for i, row := range dataRows {
+		rowNum := headerIdx + i + 2 // 1-based Excel row number
+
+		codeStr := strings.TrimSpace(safeCol(row, colCode))
+		if codeStr == "" {
+			continue // blank CODE row → skip silently
+		}
+
+		code := int(parseFloat(codeStr))
+		if code == 0 {
+			return nil, fmt.Errorf("row %d: CODE value %q is not a valid number", rowNum, codeStr)
+		}
+
+		itemName := strings.ToUpper(strings.TrimSpace(safeCol(row, colItem)))
+		if itemName == "" {
+			return nil, fmt.Errorf("row %d: CODE %d has a blank ITEM NAME — every row must have an item name", rowNum, code)
+		}
+
+		catName := ""
+		if colCat >= 0 {
+			catName = strings.ToUpper(strings.TrimSpace(safeCol(row, colCat)))
+		}
+
+		qtyRaw := strings.TrimSpace(safeCol(row, colQty))
+		var qty float64
+		if qtyRaw == "" {
+			qty = 1
+		} else {
+			qty = parseFloat(qtyRaw)
+		}
+
+		rows = append(rows, stockXlsxRow{
+			Code:     code,
+			CP:       parseFloat(safeCol(row, colCP)),
+			SP:       parseFloat(safeCol(row, colSP)),
+			HSNCode:  strings.TrimSpace(safeCol(row, colHSN)),
+			Qty:      qty,
+			ItemName: itemName,
+			Category: catName,
+		})
+	}
+
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("no valid data rows found — all rows had a blank CODE value")
+	}
+
+	return rows, nil
+}
+
+// ImportStockToWarehouse imports stock from a flat xlsx (CODE, CP, SP, HSN CODE, QTY, ITEM NAME, CATEGORY)
+// into the warehouse identified by warehouseIDStr.
+//
+// Per-row logic:
+//   - CODE matches existing variant_code → add QTY to stocks (upsert)
+//   - CODE not found → create category (if needed), product, variant, then stock entry
+func (s *Store) ImportStockToWarehouse(fileBytes []byte, warehouseIDStr string, dryRun bool) (*StockImportResult, error) {
+	warehouseID, err := uuid.Parse(warehouseIDStr)
+	if err != nil {
+		return nil, fmt.Errorf("'%s' is not a valid warehouse ID — expected a UUID like a1b2c3d4-e5f6-7890-abcd-ef1234567890", warehouseIDStr)
+	}
+
+	// Verify warehouse exists
+	var exists bool
+	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM warehouses WHERE id = $1)`, warehouseID).Scan(&exists); err != nil {
+		return nil, fmt.Errorf("could not verify warehouse: %w", err)
+	}
+	if !exists {
+		return nil, fmt.Errorf("warehouse with ID '%s' does not exist — please check the warehouse ID", warehouseIDStr)
+	}
+
+	rows, err := parseStockXlsx(fileBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	result := &StockImportResult{TotalRows: len(rows)}
+
+	// ── Resolve all existing variant codes in one query ──
+	// variant_code is NOT unique (migration 000005 dropped the constraint), so
+	// one code can map to multiple variant IDs — collect all of them.
+	existingVariants := make(map[int][]uuid.UUID) // variant_code → []variant_id
+	{
+		dbRows, err := s.db.Query(`SELECT variant_code, id FROM variants`)
+		if err != nil {
+			return nil, fmt.Errorf("load variants: %w", err)
+		}
+		for dbRows.Next() {
+			var code int
+			var id uuid.UUID
+			if err := dbRows.Scan(&code, &id); err != nil {
+				dbRows.Close()
+				return nil, fmt.Errorf("scan variant: %w", err)
+			}
+			existingVariants[code] = append(existingVariants[code], id)
+		}
+		dbRows.Close()
+		if err := dbRows.Err(); err != nil {
+			return nil, fmt.Errorf("variant rows: %w", err)
+		}
+	}
+
+	// Partition rows into: matched (code exists) and unmatched (need full create).
+	// Pre-aggregate qty by variant ID for matched rows, by code for unmatched rows.
+	// Each matched Excel code fans out to ALL variant IDs that share that code.
+	type matchedRow struct {
+		variantID uuid.UUID
+		qty       float64
+	}
+	type unmatchedRow struct {
+		code     int
+		cp       float64
+		sp       float64
+		hsnCode  string
+		qty      float64
+		itemName string
+		category string
+	}
+
+	matchedMap := make(map[uuid.UUID]*matchedRow)
+	unmatchedMap := make(map[int]*unmatchedRow)
+
+	for _, r := range rows {
+		if r.Qty <= 0 {
+			result.SkippedRows++
+			continue
+		}
+		qty := math.Round(r.Qty*100) / 100
+		if varIDs, ok := existingVariants[r.Code]; ok {
+			// Fan out: every variant sharing this code gets the stock addition.
+			for _, varID := range varIDs {
+				if entry, exists := matchedMap[varID]; exists {
+					entry.qty += qty
+				} else {
+					matchedMap[varID] = &matchedRow{variantID: varID, qty: qty}
+				}
+			}
+		} else {
+			if entry, exists := unmatchedMap[r.Code]; exists {
+				entry.qty += qty
+			} else {
+				unmatchedMap[r.Code] = &unmatchedRow{
+					code:     r.Code,
+					cp:       r.CP,
+					sp:       r.SP,
+					hsnCode:  r.HSNCode,
+					qty:      qty,
+					itemName: r.ItemName,
+					category: r.Category,
+				}
+			}
+		}
+	}
+
+	matched := make([]matchedRow, 0, len(matchedMap))
+	for _, m := range matchedMap {
+		matched = append(matched, *m)
+	}
+	unmatched := make([]unmatchedRow, 0, len(unmatchedMap))
+	for _, u := range unmatchedMap {
+		unmatched = append(unmatched, *u)
+	}
+
+	// Validate all rows that need new variant creation.
+	for _, u := range unmatched {
+		if u.category == "" {
+			return nil, fmt.Errorf(
+				"CODE %d (%s) is a new item not found in the database, but its CATEGORY cell is blank — a category is required to create a new product",
+				u.code, u.itemName,
+			)
+		}
+		if u.sp <= 0 {
+			return nil, fmt.Errorf(
+				"CODE %d (%s) is a new item not found in the database, but its SP (selling price) is blank or zero — a price is required to create a new variant",
+				u.code, u.itemName,
+			)
+		}
+	}
+
+	if len(matched) == 0 && len(unmatched) == 0 {
+		return nil, fmt.Errorf(
+			"no rows were imported — all %d row(s) had zero or negative quantity",
+			result.TotalRows,
+		)
+	}
+
+	if dryRun {
+		// Count what would happen — query DB for existing categories/products
+		// so the preview is accurate (no writes).
+		result.StockUpdated = len(matched)
+
+		catsSeen := make(map[string]bool)
+		prodsSeen := make(map[string]bool) // "UPPER(cat)|LOWER(item)"
+		for _, u := range unmatched {
+			catsSeen[u.category] = true
+			prodsSeen[u.category+"|"+strings.ToLower(u.itemName)] = true
+		}
+
+		// Check which categories already exist (case-insensitive).
+		if len(catsSeen) > 0 {
+			args := make([]interface{}, 0, len(catsSeen))
+			for n := range catsSeen {
+				args = append(args, n)
+			}
+			var sb strings.Builder
+			sb.WriteString(`SELECT UPPER(name) FROM categories WHERE UPPER(name) IN (`)
+			for i := range args {
+				if i > 0 {
+					sb.WriteString(", ")
+				}
+				fmt.Fprintf(&sb, "$%d", i+1)
+			}
+			sb.WriteString(`)`)
+			dbRows, err := s.db.Query(sb.String(), args...)
+			if err != nil {
+				return nil, fmt.Errorf("dry-run category lookup: %w", err)
+			}
+			for dbRows.Next() {
+				var name string
+				if err := dbRows.Scan(&name); err != nil {
+					dbRows.Close()
+					return nil, fmt.Errorf("dry-run category scan: %w", err)
+				}
+				catsSeen[name] = false // false = already exists
+			}
+			dbRows.Close()
+		}
+		for _, isNew := range catsSeen {
+			if isNew {
+				result.CategoriesCreated++
+			}
+		}
+
+		// Check which products already exist (by category+name, case-insensitive).
+		if len(prodsSeen) > 0 {
+			dbRows, err := s.db.Query(
+				`SELECT UPPER(c.name), LOWER(p.name)
+				 FROM products p JOIN categories c ON p.category_id = c.id`,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("dry-run product lookup: %w", err)
+			}
+			for dbRows.Next() {
+				var cat, prod string
+				if err := dbRows.Scan(&cat, &prod); err != nil {
+					dbRows.Close()
+					return nil, fmt.Errorf("dry-run product scan: %w", err)
+				}
+				key := cat + "|" + prod
+				if _, wanted := prodsSeen[key]; wanted {
+					prodsSeen[key] = false // already exists
+				}
+			}
+			dbRows.Close()
+		}
+		for _, isNew := range prodsSeen {
+			if isNew {
+				result.ProductsCreated++
+			}
+		}
+
+		result.VariantsCreated = len(unmatched)
+		result.StockCreated = len(unmatched)
+		for _, m := range matched {
+			result.TotalQtyImported += m.qty
+		}
+		for _, u := range unmatched {
+			result.TotalQtyImported += u.qty
+		}
+		return result, nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// ── 1. Upsert stock for matched variants (batches of 500) ──
+	const batchSize = 500
+	for i := 0; i < len(matched); i += batchSize {
+		end := i + batchSize
+		if end > len(matched) {
+			end = len(matched)
+		}
+		batch := matched[i:end]
+
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO stocks (id, variant_id, warehouse_id, quantity, stock_type) VALUES `)
+		args := make([]interface{}, 0, len(batch)*3)
+		for j, m := range batch {
+			if j > 0 {
+				sb.WriteString(", ")
+			}
+			base := j * 3
+			fmt.Fprintf(&sb, "(uuid_generate_v4(), $%d, $%d, $%d, 'PRODUCT')", base+1, base+2, base+3)
+			args = append(args, m.variantID, warehouseID, m.qty)
+		}
+		sb.WriteString(` ON CONFLICT (variant_id, warehouse_id)
+		 DO UPDATE SET quantity = stocks.quantity + EXCLUDED.quantity, updated_at = NOW()`)
+		if _, err := tx.Exec(sb.String(), args...); err != nil {
+			return nil, fmt.Errorf("stock upsert (matched): %w", err)
+		}
+		result.StockUpdated += len(batch)
+		for _, m := range batch {
+			result.TotalQtyImported += m.qty
+		}
+	}
+
+	if len(unmatched) == 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("commit: %w", err)
+		}
+		return result, nil
+	}
+
+	// ── 2. Resolve / create categories for unmatched rows ──
+	catNamesNeeded := make(map[string]bool)
+	for _, u := range unmatched {
+		catNamesNeeded[u.category] = true
+	}
+
+	catIDs := make(map[string]uuid.UUID) // UPPER(name) → id
+	for catName := range catNamesNeeded {
+		id := uuid.New()
+		if err := tx.QueryRow(
+			`INSERT INTO categories (id, name, is_active)
+			 VALUES ($1, $2, true)
+			 ON CONFLICT (name) DO UPDATE SET name = categories.name
+			 RETURNING id`,
+			id, catName,
+		).Scan(&id); err != nil {
+			return nil, fmt.Errorf("upsert category %q: %w", catName, err)
+		}
+		catIDs[catName] = id
+	}
+
+	// Also handle case-insensitive conflict: fetch any pre-existing category
+	// whose UPPER(name) matches one of our keys (handles mixed-case existing rows).
+	{
+		catSlice := make([]interface{}, 0, len(catNamesNeeded))
+		for n := range catNamesNeeded {
+			catSlice = append(catSlice, n)
+		}
+		var sb strings.Builder
+		sb.WriteString(`SELECT id, UPPER(name) FROM categories WHERE UPPER(name) IN (`)
+		for i := range catSlice {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			fmt.Fprintf(&sb, "$%d", i+1)
+		}
+		sb.WriteString(`)`)
+		dbRows, err := tx.Query(sb.String(), catSlice...)
+		if err != nil {
+			return nil, fmt.Errorf("category lookup: %w", err)
+		}
+		for dbRows.Next() {
+			var id uuid.UUID
+			var upperName string
+			if err := dbRows.Scan(&id, &upperName); err != nil {
+				dbRows.Close()
+				return nil, fmt.Errorf("scan category: %w", err)
+			}
+			catIDs[upperName] = id // overwrite with actual DB id
+		}
+		dbRows.Close()
+	}
+
+	result.CategoriesCreated = len(catNamesNeeded)
+
+	// ── 3. Resolve / create products for unmatched rows ──
+	type prodKey struct {
+		catName  string
+		itemName string
+	}
+	prodKeysNeeded := make(map[prodKey]bool)
+	for _, u := range unmatched {
+		prodKeysNeeded[prodKey{catName: u.category, itemName: u.itemName}] = true
+	}
+
+	// Bulk insert (ON CONFLICT DO NOTHING keeps existing products)
+	type prodInfo struct {
+		id      uuid.UUID
+		catName string
+		item    string
+		catID   uuid.UUID
+	}
+	var allProds []prodInfo
+	for pk := range prodKeysNeeded {
+		allProds = append(allProds, prodInfo{
+			id:      uuid.New(),
+			catName: pk.catName,
+			item:    pk.itemName,
+			catID:   catIDs[pk.catName],
+		})
+	}
+
+	for i := 0; i < len(allProds); i += batchSize {
+		end := i + batchSize
+		if end > len(allProds) {
+			end = len(allProds)
+		}
+		batch := allProds[i:end]
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO products (id, name, category_id, is_active, is_web_visible, uom) VALUES `)
+		args := make([]interface{}, 0, len(batch)*3)
+		for j, p := range batch {
+			if j > 0 {
+				sb.WriteString(", ")
+			}
+			base := j * 3
+			fmt.Fprintf(&sb, "($%d, $%d, $%d, true, true, 'Unit')", base+1, base+2, base+3)
+			args = append(args, p.id, p.item, p.catID)
+		}
+		sb.WriteString(` ON CONFLICT DO NOTHING`)
+		if _, err := tx.Exec(sb.String(), args...); err != nil {
+			return nil, fmt.Errorf("bulk product insert: %w", err)
+		}
+	}
+	result.ProductsCreated = len(allProds)
+
+	// Fetch actual product IDs (handles both newly inserted and pre-existing)
+	prodIDs := make(map[string]uuid.UUID) // "UPPER(cat)|LOWER(item)" → id
+	{
+		catIDSlice := make([]interface{}, 0, len(catIDs))
+		catIDtoName := make(map[uuid.UUID]string)
+		for name, id := range catIDs {
+			catIDSlice = append(catIDSlice, id)
+			catIDtoName[id] = name
+		}
+		var sb strings.Builder
+		sb.WriteString(`SELECT id, LOWER(name), category_id FROM products WHERE category_id IN (`)
+		for i := range catIDSlice {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			fmt.Fprintf(&sb, "$%d", i+1)
+		}
+		sb.WriteString(`)`)
+		dbRows, err := tx.Query(sb.String(), catIDSlice...)
+		if err != nil {
+			return nil, fmt.Errorf("product lookup: %w", err)
+		}
+		for dbRows.Next() {
+			var id, catID uuid.UUID
+			var lowerName string
+			if err := dbRows.Scan(&id, &lowerName, &catID); err != nil {
+				dbRows.Close()
+				return nil, fmt.Errorf("scan product: %w", err)
+			}
+			prodIDs[catIDtoName[catID]+"|"+lowerName] = id
+		}
+		dbRows.Close()
+	}
+
+	// ── 4. Build variant rows for unmatched ──
+	type newVariant struct {
+		id        uuid.UUID
+		productID uuid.UUID
+		code      int
+		name      string
+		sku       string
+		barcode   string
+		price     float64
+		costPrice float64
+		hsnCode   string
+		qty       float64
+	}
+
+	allVariants := make([]newVariant, 0, len(unmatched))
+	for _, u := range unmatched {
+		pk := u.category + "|" + strings.ToLower(u.itemName)
+		productID, ok := prodIDs[pk]
+		if !ok {
+			return nil, fmt.Errorf("product ID not found for %q in category %q", u.itemName, u.category)
+		}
+		cp := u.cp
+		if cp <= 0 {
+			cp = u.sp
+		}
+		allVariants = append(allVariants, newVariant{
+			id:        uuid.New(),
+			productID: productID,
+			code:      u.code,
+			name:      fmt.Sprintf("%s - %d", u.itemName, u.code),
+			sku:       generateSKU(u.category, u.code),
+			barcode:   generateBarcode(),
+			price:     u.sp,
+			costPrice: cp,
+			hsnCode:   u.hsnCode,
+			qty:       u.qty,
+		})
+	}
+
+	// ── 5. Bulk insert variants (ON CONFLICT DO NOTHING) ──
+	for i := 0; i < len(allVariants); i += batchSize {
+		end := i + batchSize
+		if end > len(allVariants) {
+			end = len(allVariants)
+		}
+		batch := allVariants[i:end]
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO variants (id, product_id, variant_code, name, sku, barcode, price, cost_price, hsn_code, is_active) VALUES `)
+		args := make([]interface{}, 0, len(batch)*9)
+		for j, v := range batch {
+			if j > 0 {
+				sb.WriteString(", ")
+			}
+			base := j * 9
+			fmt.Fprintf(&sb, "($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, true)",
+				base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9)
+			args = append(args, v.id, v.productID, v.code, v.name, v.sku, v.barcode, v.price, v.costPrice, v.hsnCode)
+		}
+		sb.WriteString(` ON CONFLICT DO NOTHING`)
+		if _, err := tx.Exec(sb.String(), args...); err != nil {
+			return nil, fmt.Errorf("bulk variant insert: %w", err)
+		}
+	}
+	result.VariantsCreated = len(allVariants)
+
+	// Fetch actual variant IDs for the codes we just inserted
+	// (needed because ON CONFLICT DO NOTHING means some may already exist)
+	variantIDByCode := make(map[int]uuid.UUID)
+	{
+		codes := make([]interface{}, 0, len(allVariants))
+		for _, v := range allVariants {
+			codes = append(codes, v.code)
+		}
+		var sb strings.Builder
+		sb.WriteString(`SELECT id, variant_code FROM variants WHERE variant_code IN (`)
+		for i := range codes {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			fmt.Fprintf(&sb, "$%d", i+1)
+		}
+		sb.WriteString(`)`)
+		dbRows, err := tx.Query(sb.String(), codes...)
+		if err != nil {
+			return nil, fmt.Errorf("variant id lookup: %w", err)
+		}
+		for dbRows.Next() {
+			var id uuid.UUID
+			var code int
+			if err := dbRows.Scan(&id, &code); err != nil {
+				dbRows.Close()
+				return nil, fmt.Errorf("scan variant id: %w", err)
+			}
+			variantIDByCode[code] = id
+		}
+		dbRows.Close()
+	}
+
+	// ── 6. Bulk upsert stock for newly created variants ──
+	for i := 0; i < len(allVariants); i += batchSize {
+		end := i + batchSize
+		if end > len(allVariants) {
+			end = len(allVariants)
+		}
+		batch := allVariants[i:end]
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO stocks (id, variant_id, warehouse_id, quantity, stock_type) VALUES `)
+		args := make([]interface{}, 0, len(batch)*3)
+		for j, v := range batch {
+			varID := variantIDByCode[v.code]
+			if varID == (uuid.UUID{}) {
+				varID = v.id // fallback to the id we generated
+			}
+			if j > 0 {
+				sb.WriteString(", ")
+			}
+			base := j * 3
+			fmt.Fprintf(&sb, "(uuid_generate_v4(), $%d, $%d, $%d, 'PRODUCT')", base+1, base+2, base+3)
+			args = append(args, varID, warehouseID, v.qty)
+		}
+		sb.WriteString(` ON CONFLICT (variant_id, warehouse_id)
+		 DO UPDATE SET quantity = stocks.quantity + EXCLUDED.quantity, updated_at = NOW()`)
+		if _, err := tx.Exec(sb.String(), args...); err != nil {
+			return nil, fmt.Errorf("stock upsert (new variants): %w", err)
+		}
+		result.StockCreated += len(batch)
+		for _, v := range batch {
+			result.TotalQtyImported += v.qty
+		}
+	}
+
+	// ── 7. Update category product counts ──
+	for _, catID := range catIDs {
+		if _, err := tx.Exec(
+			`UPDATE categories SET products_count = (
+				SELECT COUNT(*) FROM products WHERE category_id = $1
+			) WHERE id = $1`, catID,
+		); err != nil {
+			return nil, fmt.Errorf("update category count: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit: %w", err)
+	}
+
+	return result, nil
+}

@@ -1,0 +1,153 @@
+package production
+
+import (
+	"database/sql"
+	"log"
+	"net/http"
+
+	"defab-erp/internal/core/httperr"
+	"defab-erp/internal/core/model"
+
+	"github.com/gofiber/fiber/v2"
+)
+
+type Handler struct {
+	store *Store
+}
+
+func NewHandler(s *Store) *Handler {
+	return &Handler{store: s}
+}
+
+func (h *Handler) Create(c *fiber.Ctx) error {
+	var in CreateProductionOrderInput
+	if err := c.BodyParser(&in); err != nil {
+		return httperr.BadRequest(c, "Invalid JSON body")
+	}
+	if in.OutputQuantity <= 0 {
+		return httperr.BadRequest(c, "output_quantity is required")
+	}
+
+	// Validate: one of the 3 scenarios must be satisfied
+	hasVariant := in.OutputVariantID != ""
+	hasProductWithNewVariant := in.OutputProductID != "" && in.NewVariant != nil
+	hasNewProductWithNewVariant := in.NewProduct != nil && in.NewVariant != nil
+
+	if !hasVariant && !hasProductWithNewVariant && !hasNewProductWithNewVariant {
+		return httperr.BadRequest(c, "provide output_variant_id, or output_product_id + new_variant, or new_product + new_variant")
+	}
+	if in.NewVariant != nil && in.NewVariant.Name == "" {
+		return httperr.BadRequest(c, "new_variant.name is required")
+	}
+	if in.NewVariant != nil && in.NewVariant.Price <= 0 {
+		return httperr.BadRequest(c, "new_variant.price is required")
+	}
+	if in.NewProduct != nil && in.NewProduct.Name == "" {
+		return httperr.BadRequest(c, "new_product.name is required")
+	}
+
+	user := c.Locals("user").(*model.User)
+	branchID := ""
+	if user.BranchID != nil {
+		branchID = *user.BranchID
+	}
+	warehouseID := ""
+	if branchID != "" {
+		_ = h.store.db.QueryRow(`SELECT id FROM warehouses WHERE branch_id = $1 LIMIT 1`, branchID).Scan(&warehouseID)
+	}
+
+	id, err := h.store.CreateProductionOrder(in, user.ID.String(), branchID, warehouseID)
+	if err != nil {
+		log.Println("create production order error:", err)
+		return c.Status(500).JSON(fiber.Map{"error": "INTERNAL_ERROR", "message": err.Error()})
+	}
+	return c.Status(http.StatusCreated).JSON(fiber.Map{"production_order_id": id})
+}
+
+func (h *Handler) List(c *fiber.Ctx) error {
+	limitStr := c.Query("limit")
+	offsetStr := c.Query("offset")
+
+	limit := 0
+	offset := 0
+	if limitStr != "" || offsetStr != "" {
+		limit = c.QueryInt("limit", 20)
+		if limit < 1 {
+			limit = 20
+		}
+		offset = c.QueryInt("offset", 0)
+		if offset < 0 {
+			offset = 0
+		}
+	}
+
+	status := c.Query("status")
+	search := c.Query("search")
+
+	user := c.Locals("user").(*model.User)
+	var branchID *string
+	if user.Role.Name == model.RoleStoreManager || user.Role.Name == model.RoleSalesPerson {
+		if user.BranchID != nil {
+			branchID = user.BranchID
+		}
+	} else if bid := c.Query("branch_id"); bid != "" {
+		branchID = &bid
+	}
+
+	list, total, err := h.store.List(branchID, status, search, limit, offset)
+	if err != nil {
+		log.Println("list production orders error:", err)
+		return httperr.Internal(c)
+	}
+	return c.JSON(fiber.Map{"production_orders": list, "total": total, "limit": limit, "offset": offset})
+}
+
+func (h *Handler) GetByID(c *fiber.Ctx) error {
+	id := c.Params("id")
+	result, err := h.store.GetByID(id)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return httperr.NotFound(c, "Production order not found")
+		}
+		log.Println("get production order error:", err)
+		return httperr.Internal(c)
+	}
+	return c.JSON(result)
+}
+
+func (h *Handler) PushStatus(c *fiber.Ctx) error {
+	id := c.Params("id")
+	var in StatusUpdateInput
+	if err := c.BodyParser(&in); err != nil {
+		return httperr.BadRequest(c, "Invalid JSON body")
+	}
+	if in.Status == "" {
+		return httperr.BadRequest(c, "status is required")
+	}
+	user := c.Locals("user").(*model.User)
+	if err := h.store.PushStatus(id, in, user.ID.String()); err != nil {
+		log.Println("push production status error:", err)
+		return httperr.Internal(c)
+	}
+	return c.JSON(fiber.Map{"message": "status updated"})
+}
+
+func (h *Handler) Complete(c *fiber.Ctx) error {
+	id := c.Params("id")
+	user := c.Locals("user").(*model.User)
+	if err := h.store.Complete(id, user.ID.String()); err != nil {
+		log.Println("complete production order error:", err)
+		return httperr.Internal(c)
+	}
+	return c.JSON(fiber.Map{"message": "production completed, stock updated"})
+}
+
+func (h *Handler) Cancel(c *fiber.Ctx) error {
+	id := c.Params("id")
+	user := c.Locals("user").(*model.User)
+	if err := h.store.Cancel(id, user.ID.String()); err != nil {
+		log.Println("cancel production order error:", err)
+		return httperr.Internal(c)
+	}
+	return c.JSON(fiber.Map{"message": "cancelled"})
+}

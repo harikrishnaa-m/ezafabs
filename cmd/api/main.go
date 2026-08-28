@@ -1,0 +1,906 @@
+package main
+
+import (
+	"log"
+	"os"
+	"time"
+
+	"defab-erp/internal/auth"
+	"defab-erp/internal/core/db"
+
+	"defab-erp/internal/stocktransfer"
+
+	"defab-erp/internal/warehouse"
+
+	"defab-erp/internal/core/model"
+	"defab-erp/internal/middleware"
+
+	"defab-erp/internal/role"
+
+	"defab-erp/internal/branch"
+
+	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/cors"
+	"github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/gofiber/fiber/v2/middleware/recover"
+	"github.com/joho/godotenv"
+
+	"defab-erp/internal/attribute"
+	"defab-erp/internal/category"
+	"defab-erp/internal/product"
+
+	"defab-erp/internal/productdescription"
+
+	"defab-erp/internal/user"
+	"defab-erp/internal/variant"
+
+	"defab-erp/internal/core/storage"
+
+	"defab-erp/internal/accounting"
+	"defab-erp/internal/attendance"
+	"defab-erp/internal/billing"
+	"defab-erp/internal/coupon"
+	"defab-erp/internal/customer"
+	"defab-erp/internal/dashboard"
+	"defab-erp/internal/employee"
+	"defab-erp/internal/goodsreceipt"
+	"defab-erp/internal/jobinvoice"
+	"defab-erp/internal/joborder"
+	"defab-erp/internal/jobworker"
+	"defab-erp/internal/production"
+	"defab-erp/internal/purchase"
+	"defab-erp/internal/purchaseinvoice"
+	"defab-erp/internal/rawmaterial"
+	"defab-erp/internal/returns"
+	"defab-erp/internal/salesinvoice"
+	"defab-erp/internal/salesorder"
+	"defab-erp/internal/salesperson"
+	"defab-erp/internal/stock"
+	"defab-erp/internal/stockrequest"
+	"defab-erp/internal/supplier"
+
+	ecomCart "defab-erp/internal/ecom/cart"
+	ecomCustomer "defab-erp/internal/ecom/customer"
+	ecomMw "defab-erp/internal/ecom/middleware"
+	ecomOnlineStock "defab-erp/internal/ecom/onlinestock"
+	ecomOrder "defab-erp/internal/ecom/order"
+	ecomPayment "defab-erp/internal/ecom/payment"
+	ecomProduct "defab-erp/internal/ecom/product"
+	ecomReturn "defab-erp/internal/ecom/return"
+	ecomWishlist "defab-erp/internal/ecom/wishlist"
+
+	"defab-erp/internal/directgrn"
+	"defab-erp/internal/exchange"
+	"defab-erp/internal/hsnreport"
+	"defab-erp/internal/migration"
+	"defab-erp/internal/paymentreport"
+	"defab-erp/internal/purchasereport"
+	"defab-erp/internal/purchasereturn"
+	"defab-erp/internal/salesreport"
+	"defab-erp/internal/supplieraging"
+	"defab-erp/internal/supplieranalysis"
+	"defab-erp/internal/supplierstatement"
+)
+
+func main() {
+
+	err := godotenv.Load()
+	if err != nil {
+		log.Println("⚠ .env file not found, using system ENV")
+	}
+	// 1. DB
+	database := db.Connect()
+	defer database.Close()
+
+	// Redis (optional — nil means caching disabled)
+	redisClient := db.ConnectRedis()
+	if redisClient != nil {
+		defer redisClient.Close()
+	}
+
+	log.Println("⏳ Initializing storage...")
+	if err := storage.InitSpaces(); err != nil {
+		log.Println("⚠ spaces init failed (continuing without cloud storage):", err)
+	}
+	log.Println("✅ Storage initialized")
+
+	// 2. Stores (Data Layer)
+	authStore := auth.NewStore(database)
+	// productStore := product.NewStore(database)
+
+	// 3. Handlers (HTTP Layer)
+	authHandler := auth.NewHandler(authStore)
+	// productHandler := product.NewHandler(productStore)
+
+	roleStore := role.NewStore(database)
+	roleHandler := role.NewHandler(roleStore)
+
+	branchStore := branch.NewStore(database)
+	branchHandler := branch.NewHandler(branchStore)
+
+	warehouseStore := warehouse.NewStore(database)
+	warehouseHandler := warehouse.NewHandler(warehouseStore)
+
+	userStore := user.NewStore(database)
+	userHandler := user.NewHandler(userStore)
+
+	categoryStore := category.NewStore(database)
+	categoryHandler := category.NewHandler(categoryStore)
+
+	productStore := product.NewStore(database)
+	productHandler := product.NewHandler(productStore)
+
+	pdStore := productdescription.NewStore(database)
+	pdHandler := productdescription.NewHandler(pdStore)
+
+	attributeStore := attribute.NewStore(database)
+	attributeHandler := attribute.NewHandler(attributeStore)
+
+	variantStore := variant.NewStore(database)
+	variantHandler := variant.NewHandler(variantStore)
+
+	supplierStore := supplier.NewStore(database)
+	supplierHandler := supplier.NewHandler(supplierStore)
+
+	purchaseStore := purchase.NewStore(database)
+	purchaseHandler := purchase.NewHandler(purchaseStore)
+
+	goodsStore := goodsreceipt.NewStore(database)
+	goodsHandler := goodsreceipt.NewHandler(goodsStore)
+
+	stockTransferStore := stocktransfer.NewStore(database)
+	stockTransferHandler := stocktransfer.NewHandler(stockTransferStore)
+
+	stockStore := stock.NewStore(database)
+	stockHandler := stock.NewHandler(stockStore)
+
+	stockRequestStore := stockrequest.NewStore(database)
+	stockRequestHandler := stockrequest.NewHandler(stockRequestStore)
+
+	couponStore := coupon.NewStore(database)
+	couponHandler := coupon.NewHandler(couponStore)
+
+	rawMaterialStore := rawmaterial.NewStore(database)
+	rawMaterialHandler := rawmaterial.NewHandler(rawMaterialStore)
+
+	purchaseInvoiceStore := purchaseinvoice.NewStore(database)
+	purchaseInvoiceHandler := purchaseinvoice.NewHandler(purchaseInvoiceStore)
+
+	salespersonStore := salesperson.NewStore(database)
+	salespersonHandler := salesperson.NewHandler(salespersonStore)
+
+	customerStore := customer.NewStore(database)
+	customerHandler := customer.NewHandler(customerStore)
+
+	salesOrderStore := salesorder.NewStore(database)
+	salesOrderHandler := salesorder.NewHandler(salesOrderStore)
+
+	salesInvoiceStore := salesinvoice.NewStore(database)
+
+	billingStore := billing.NewStore(database, redisClient)
+	billingHandler := billing.NewHandler(billingStore)
+
+	accountingStore := accounting.NewStore(database)
+	accountingRecorder := accounting.NewRecorder(database, accountingStore)
+	accountingHandler := accounting.NewHandler(accountingStore, accountingRecorder)
+
+	salesInvoiceHandler := salesinvoice.NewHandler(salesInvoiceStore, accountingRecorder)
+
+	returnStore := returns.NewStore(database)
+	returnHandler := returns.NewHandler(returnStore, accountingRecorder)
+
+	exchangeStore := exchange.NewStore(database)
+	exchangeHandler := exchange.NewHandler(exchangeStore, accountingRecorder)
+
+	dashboardStore := dashboard.NewStore(database)
+	dashboardHandler := dashboard.NewHandler(dashboardStore)
+
+	jobOrderStore := joborder.NewStore(database)
+	jobOrderHandler := joborder.NewHandler(jobOrderStore)
+
+	jobWorkerStore := jobworker.NewStore(database)
+	jobWorkerHandler := jobworker.NewHandler(jobWorkerStore)
+
+	jobInvoiceStore := jobinvoice.NewStore(database)
+	jobInvoiceHandler := jobinvoice.NewHandler(jobInvoiceStore)
+
+	productionStore := production.NewStore(database)
+	productionHandler := production.NewHandler(productionStore)
+
+	employeeStore := employee.NewStore(database)
+	employeeHandler := employee.NewHandler(employeeStore)
+
+	attendanceStore := attendance.NewStore(database)
+	attendanceHandler := attendance.NewHandler(attendanceStore)
+
+	// ── Ecom stores & handlers ──
+	ecomCustomerStore := ecomCustomer.NewStore(database)
+	ecomCustomerHandler := ecomCustomer.NewHandler(ecomCustomerStore)
+
+	ecomProductStore := ecomProduct.NewStore(database)
+	ecomProductHandler := ecomProduct.NewHandler(ecomProductStore)
+
+	ecomCartStore := ecomCart.NewStore(database)
+	ecomCartHandler := ecomCart.NewHandler(ecomCartStore)
+
+	ecomWishlistStore := ecomWishlist.NewStore(database)
+	ecomWishlistHandler := ecomWishlist.NewHandler(ecomWishlistStore)
+
+	ecomOrderStore := ecomOrder.NewStore(database)
+	ecomOrderHandler := ecomOrder.NewHandler(ecomOrderStore)
+
+	ecomOnlineStockStore := ecomOnlineStock.NewStore(database)
+	ecomOnlineStockHandler := ecomOnlineStock.NewHandler(ecomOnlineStockStore)
+
+	ecomPaymentStore := ecomPayment.NewStore(database)
+	ecomPaymentHandler := ecomPayment.NewHandler(ecomPaymentStore, database)
+
+	ecomReturnStore := ecomReturn.NewStore(database)
+	ecomReturnHandler := ecomReturn.NewHandler(ecomReturnStore)
+	ecomPaymentHandler.SetReturnStore(ecomReturnStore)
+
+	migrationStore := migration.NewStore(database)
+	migrationHandler := migration.NewHandler(migrationStore)
+
+	directGRNStore := directgrn.NewStore(database)
+	directGRNHandler := directgrn.NewHandler(directGRNStore, accountingRecorder)
+
+	purchaseReturnStore := purchasereturn.NewStore(database)
+	purchaseReturnHandler := purchasereturn.NewHandler(purchaseReturnStore)
+
+	supplierAgingStore := supplieraging.NewStore(database)
+	supplierAgingHandler := supplieraging.NewHandler(supplierAgingStore)
+
+	supplierAnalysisStore := supplieranalysis.NewStore(database)
+	supplierAnalysisHandler := supplieranalysis.NewHandler(supplierAnalysisStore)
+
+	purchaseReportStore := purchasereport.NewStore(database)
+	purchaseReportHandler := purchasereport.NewHandler(purchaseReportStore)
+
+	salesReportStore := salesreport.NewStore(database)
+	salesReportHandler := salesreport.NewHandler(salesReportStore)
+
+	paymentReportStore := paymentreport.NewStore(database)
+	paymentReportHandler := paymentreport.NewHandler(paymentReportStore)
+
+	hsnReportStore := hsnreport.NewStore(database)
+	hsnReportHandler := hsnreport.NewHandler(hsnReportStore)
+
+	supplierStatementStore := supplierstatement.NewStore(database)
+	supplierStatementHandler := supplierstatement.NewHandler(supplierStatementStore)
+
+	// Wire auto-recording into billing & purchase handlers
+	billingHandler.SetRecorder(accountingRecorder)
+	purchaseInvoiceHandler.SetRecorder(accountingRecorder)
+
+	// Warm Redis cache with all variants (async — don't block server start)
+	go func() {
+		if err := billingStore.WarmCache(); err != nil {
+			log.Println("⚠ Cache warm-up failed:", err)
+		} else {
+			log.Println("✅ Redis variant cache warmed")
+		}
+	}()
+
+	// 4. Fiber
+	app := fiber.New(fiber.Config{
+		BodyLimit:    50 * 1024 * 1024, // 50 MB
+		ReadTimeout:  5 * 60 * time.Second,
+		WriteTimeout: 10 * 60 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	})
+
+	app.Use(logger.New())
+	app.Use(recover.New())
+	app.Use(cors.New(cors.Config{
+		AllowOrigins:     "*",
+		AllowHeaders:     "*",
+		AllowMethods:     "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+		AllowCredentials: false,
+	}))
+
+	api := app.Group("/api")
+
+	auth.RegisterRoutes(api, authHandler)
+
+	// ═══════════════════════════════════════════
+	// E-COMMERCE PUBLIC ROUTES (before protected group)
+	// ═══════════════════════════════════════════
+	ecom := api.Group("/ecom")
+	ecomCustomer.RegisterPublicRoutes(ecom.Group("/auth"), ecomCustomerHandler)
+	ecomProduct.RegisterRoutes(ecom.Group("/products"), ecomProductHandler)
+
+	// Public webhooks — must be registered BEFORE ecomProtected is created
+	// so Fiber's ecom JWT middleware does not intercept them.
+	ecom.Post("/payments/webhook", ecomPaymentHandler.Webhook)
+	ecom.Post("/payouts/webhook", ecomPaymentHandler.PayoutWebhook)
+
+	// E-COMMERCE PROTECTED ROUTES (before ERP protected group)
+	ecomProtected := ecom.Group("", ecomMw.EcomJWTProtected(database))
+	ecomCustomer.RegisterProtectedRoutes(ecomProtected, ecomCustomerHandler)
+	ecomCart.RegisterRoutes(ecomProtected.Group("/cart"), ecomCartHandler)
+	ecomWishlist.RegisterRoutes(ecomProtected.Group("/wishlist"), ecomWishlistHandler)
+	ecomOrder.RegisterCustomerRoutes(ecomProtected.Group("/orders"), ecomOrderHandler)
+	ecomPayment.RegisterAuthRoutes(ecomProtected, ecomPaymentHandler)
+	ecomReturn.RegisterCustomerRoutes(ecomProtected, ecomReturnHandler)
+
+	// Quick test route for products
+	api.Get("/products/test", func(c *fiber.Ctx) error {
+		// Just to prove store works
+		return c.SendString("Product Store Connected")
+	})
+
+	// ---------- PROTECTED ----------
+	protected := api.Group("", middleware.JWTProtected(authStore))
+
+	role.RegisterRoutes(
+		protected.Group("/roles",
+			middleware.RequireRole(model.RoleSuperAdmin),
+		),
+		roleHandler,
+	)
+
+	branch.RegisterListRoute(
+		protected.Group("/branches",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		branchHandler,
+	)
+
+	branch.RegisterRoutes(
+		protected.Group("/branches",
+			middleware.RequireRole(model.RoleSuperAdmin, model.RoleAccountsManager),
+		),
+		branchHandler,
+	)
+
+	warehouse.RegisterListRoute(
+		protected.Group("/warehouses",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		warehouseHandler,
+	)
+
+	warehouse.RegisterRoutes(
+		protected.Group("/warehouses",
+			middleware.RequireRole(model.RoleSuperAdmin, model.RoleAccountsManager),
+		),
+		warehouseHandler,
+	)
+
+	user.RegisterListRoute(
+		protected.Group("/users",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		userHandler,
+	)
+
+	user.RegisterRoutes(
+		protected.Group("/users",
+			middleware.RequireRole(model.RoleSuperAdmin),
+		),
+		userHandler,
+	)
+
+	category.RegisterRoutes(
+		protected.Group("/categories",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		categoryHandler,
+	)
+
+	product.RegisterRoutes(
+		protected.Group("/products",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		productHandler,
+	)
+
+	productdescription.RegisterRoutes(
+		protected.Group("/product-descriptions",
+			middleware.RequireRole(model.RoleSuperAdmin, model.RoleAccountsManager),
+		),
+		pdHandler,
+	)
+
+	attribute.RegisterRoutes(
+		protected.Group("/attributes",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		attributeHandler,
+	)
+
+	variant.RegisterRoutes(
+		protected.Group("/variants",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		variantHandler,
+	)
+
+	supplier.RegisterRoutes(
+		protected.Group("/suppliers",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		supplierHandler,
+	)
+
+	salesperson.RegisterRoutes(
+		protected.Group("/salespersons",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		salespersonHandler,
+	)
+
+	customer.RegisterRoutes(
+		protected.Group("/customers",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleSalesPerson,
+				model.RoleAccountsManager,
+			),
+		),
+		customerHandler,
+	)
+
+	salesorder.RegisterRoutes(
+		protected.Group("/sales-orders",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleSalesPerson,
+				model.RoleAccountsManager,
+			),
+		),
+		salesOrderHandler,
+	)
+
+	salesinvoice.RegisterRoutes(
+		protected.Group("/sales-invoices",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleSalesPerson,
+				model.RoleAccountsManager,
+			),
+		),
+		salesInvoiceHandler,
+	)
+
+	billing.RegisterRoutes(
+		protected.Group("/billing",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleSalesPerson,
+				model.RoleAccountsManager,
+			),
+		),
+		billingHandler,
+	)
+
+	returns.RegisterRoutes(
+		protected.Group("/returns",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleSalesPerson,
+				model.RoleAccountsManager,
+			),
+		),
+		returnHandler,
+	)
+
+	exchange.RegisterRoutes(
+		protected.Group("/exchanges",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleSalesPerson,
+				model.RoleAccountsManager,
+			),
+		),
+		exchangeHandler,
+	)
+
+	purchase.RegisterRoutes(
+		protected.Group("/purchase-orders",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		purchaseHandler,
+	)
+
+	goodsreceipt.RegisterRoutes(
+		protected.Group("/goods-receipts",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		goodsHandler,
+	)
+
+	stocktransfer.RegisterRoutes(
+		protected.Group("/stock-transfers",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		stockTransferHandler,
+	)
+
+	stocktransfer.RegisterInterWarehouseRoute(
+		protected.Group("/stock-transfers",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+			),
+		),
+		stockTransferHandler,
+	)
+
+	stock.RegisterRoutes(
+		protected.Group("/stocks",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		stockHandler,
+	)
+
+	stockrequest.RegisterRoutes(
+		protected.Group("/stock-requests",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		stockRequestHandler,
+	)
+
+	coupon.RegisterRoutes(
+		protected.Group("/coupons",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		couponHandler,
+	)
+
+	rawmaterial.RegisterRoutes(
+		protected.Group("/raw-material-stocks",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		rawMaterialHandler,
+	)
+
+	purchaseinvoice.RegisterInvoiceRoutes(
+		protected.Group("/purchase-invoices",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		purchaseInvoiceHandler,
+	)
+	purchaseinvoice.RegisterPaymentRoutes(
+		protected.Group("/supplier-payments",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		purchaseInvoiceHandler,
+	)
+
+	accounting.RegisterRoutes(
+		protected.Group("/accounting",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleAccountsManager,
+				model.RoleStoreManager,
+			),
+		),
+		accountingHandler,
+	)
+
+	dashboard.RegisterRoutes(
+		protected.Group("/dashboard",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleAccountsManager,
+				model.RoleStoreManager,
+			),
+		),
+		dashboardHandler,
+	)
+
+	joborder.RegisterRoutes(
+		protected.Group("/job-orders",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		jobOrderHandler,
+	)
+
+	jobworker.RegisterRoutes(
+		protected.Group("/job-order-workers",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		jobWorkerHandler,
+	)
+
+	production.RegisterRoutes(
+		protected.Group("/production-orders",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		productionHandler,
+	)
+
+	jobinvoice.RegisterRoutes(
+		protected.Group("/job-invoices",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		jobInvoiceHandler,
+	)
+
+	employee.RegisterRoutes(
+		protected.Group("/employees",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+			),
+		),
+		employeeHandler,
+	)
+
+	attendance.RegisterRoutes(
+		protected.Group("/attendance",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+				model.RoleSalesPerson,
+				model.RoleEmployee,
+			),
+		),
+		attendanceHandler,
+	)
+
+	directgrn.RegisterRoutes(
+		protected.Group("/direct-grn",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		directGRNHandler,
+	)
+
+	purchasereturn.RegisterRoutes(
+		protected.Group("/purchase-returns",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		purchaseReturnHandler,
+	)
+
+	supplieraging.RegisterRoutes(
+		protected.Group("/supplier-aging",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		supplierAgingHandler,
+	)
+
+	supplieranalysis.RegisterRoutes(
+		protected.Group("/supplier-analysis",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		supplierAnalysisHandler,
+	)
+
+	purchasereport.RegisterRoutes(
+		protected.Group("/purchase-report",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		purchaseReportHandler,
+	)
+
+	salesreport.RegisterRoutes(
+		protected.Group("/sales-report",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleSalesPerson,
+				model.RoleAccountsManager,
+			),
+		),
+		salesReportHandler,
+	)
+
+	paymentreport.RegisterRoutes(
+		protected.Group("/payment-report",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleSalesPerson,
+				model.RoleAccountsManager,
+			),
+		),
+		paymentReportHandler,
+	)
+
+	hsnreport.RegisterRoutes(
+		protected.Group("/hsn-report",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		hsnReportHandler,
+	)
+
+	supplierstatement.RegisterRoutes(
+		protected.Group("/supplier-statement",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		supplierStatementHandler,
+	)
+
+	protected.Get("/me", func(c *fiber.Ctx) error {
+		user := c.Locals("user").(*model.User)
+		return c.JSON(user)
+	})
+
+	protected.Get("/admin-only",
+		middleware.RequireRole("SuperAdmin"),
+		func(c *fiber.Ctx) error {
+			return c.SendString("Hello SuperAdmin")
+		},
+	)
+
+	// ═══════════════════════════════════════════
+	// E-COMMERCE ADMIN ROUTES (ERP staff managing ecom orders)
+	// ═══════════════════════════════════════════
+
+	migration.RegisterRoutes(
+		protected.Group("/migration",
+			middleware.RequireRole(model.RoleSuperAdmin),
+		),
+		migrationHandler,
+	)
+
+	// Admin: ERP staff managing ecom orders
+	ecomOrder.RegisterAdminRoutes(
+		protected.Group("/admin/ecom-orders",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+			),
+		),
+		ecomOrderHandler,
+	)
+
+	// Admin: ERP staff managing ecom returns
+	ecomReturn.RegisterAdminRoutes(
+		protected.Group("/admin/ecom-returns",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+			),
+		),
+		ecomReturnHandler,
+	)
+
+	// Admin: ERP staff managing online reserved stock
+	ecomOnlineStock.RegisterRoutes(
+		protected.Group("/admin/online-stocks",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+			),
+		),
+		ecomOnlineStockHandler,
+	)
+
+	// Start server
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "3000"
+	}
+
+	log.Printf("🔗 PG webhook:     %s", os.Getenv("CASHFREE_WEBHOOK_URL"))
+	log.Printf("🔗 Payout webhook: %s", os.Getenv("CASHFREE_PAYOUT_WEBHOOK_URL"))
+
+	log.Fatal(app.Listen(":" + port))
+}
