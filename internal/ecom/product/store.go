@@ -113,11 +113,10 @@ func (s *Store) ListProducts(categoryID string, search string, page, limit int) 
 
 		varRows, err := s.db.Query(`
 			SELECT v.id, v.product_id, v.variant_code, v.name, v.sku, v.price, COALESCE(v.barcode, ''),
-			       COALESCE(SUM(st.quantity), 0) AS total_stock
+			       COALESCE(os.quantity, 0) AS online_stock
 			FROM variants v
-			LEFT JOIN stocks st ON st.variant_id = v.id
+			LEFT JOIN online_stocks os ON os.variant_id = v.id
 			WHERE v.product_id IN (`+prodIn+`) AND v.is_active = true
-			GROUP BY v.id, v.product_id, v.variant_code, v.name, v.sku, v.price, v.barcode
 			ORDER BY v.variant_code
 		`, prodArgs...)
 		if err == nil {
@@ -264,11 +263,10 @@ func (s *Store) GetProductDetail(productID string) (map[string]interface{}, erro
 	// Variants with stock
 	varRows, err := s.db.Query(`
 		SELECT v.id, v.variant_code, v.name, v.sku, v.price, COALESCE(v.barcode, ''),
-		       COALESCE(SUM(st.quantity), 0) AS total_stock
+		       COALESCE(os.quantity, 0) AS online_stock
 		FROM variants v
-		LEFT JOIN stocks st ON st.variant_id = v.id
+		LEFT JOIN online_stocks os ON os.variant_id = v.id
 		WHERE v.product_id = $1 AND v.is_active = true
-		GROUP BY v.id, v.variant_code, v.name, v.sku, v.price, v.barcode
 		ORDER BY v.variant_code
 	`, productID)
 	if err != nil {
