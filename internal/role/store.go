@@ -31,7 +31,7 @@ func (s *Store) Create(name, permissions string) error {
 
 func (s *Store) List() ([]model.Role, error) {
 	rows, err := s.db.Query(
-		`SELECT id, name, permissions
+		`SELECT id, name, COALESCE(permissions, '')
 		 FROM roles
 		 ORDER BY id`,
 	)

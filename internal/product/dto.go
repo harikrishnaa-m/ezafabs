@@ -16,6 +16,23 @@ type CreateProductInput struct {
 	UOM          string `json:"uom"`
 }
 
+type CreateProductWithVariantsInput struct {
+	CreateProductInput
+	MainImageURL     string                      `json:"main_image_url"`
+	GalleryImageURLs []string                    `json:"gallery_image_urls"`
+	IsActive         *bool                       `json:"is_active"`
+	Variants         []CreateProductVariantInput `json:"variants"`
+}
+
+type CreateProductVariantInput struct {
+	Price             float64  `json:"price"`
+	CostPrice         float64  `json:"cost_price"`
+	HSNCode           string   `json:"hsn_code"`
+	IsActive          *bool    `json:"is_active"`
+	AttributeValueIDs []string `json:"attribute_value_ids"`
+	ImagePaths        []string `json:"image_paths"`
+}
+
 type UpdateProductInput struct {
 	Name       *string `json:"name"`
 	CategoryID *string `json:"category_id"`

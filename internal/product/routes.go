@@ -4,6 +4,9 @@ import "github.com/gofiber/fiber/v2"
 
 func RegisterRoutes(r fiber.Router, h *Handler) {
 	r.Post("/", h.Create) //tested
+	r.Post("/with-variants", h.CreateWithVariants)
+	r.Post("/upload-image", h.UploadImage)
+	r.Post("/upload-images", h.UploadImages)
 
 	r.Put("/:id/main-image", h.ReplaceMainImage)       //tested
 	r.Post("/:id/images", h.AddGalleryImages)          //tested

@@ -1,7 +1,10 @@
 package product
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"fmt"
+	"math/big"
 	"strings"
 )
 
@@ -202,6 +205,186 @@ func (s *Store) CreateProduct(
 	// Increment products_count for the category
 	_ = s.IncrementCategoryProductCount(in.CategoryID)
 	return id, nil
+}
+
+func (s *Store) CreateProductWithVariants(in CreateProductWithVariantsInput) (string, []map[string]interface{}, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", nil, err
+	}
+	defer tx.Rollback()
+
+	isWebVisible := true
+	if in.IsWebVisible != nil {
+		isWebVisible = *in.IsWebVisible
+	}
+	isStitched := false
+	if in.IsStitched != nil {
+		isStitched = *in.IsStitched
+	}
+	uom := in.UOM
+	if uom == "" {
+		uom = "Unit"
+	}
+	isActive := true
+	if in.IsActive != nil {
+		isActive = *in.IsActive
+	}
+
+	var productID string
+	err = tx.QueryRow(`
+		INSERT INTO products
+		(name, category_id, brand, description, fabric_composition, pattern, occasion,
+		 care_instructions, main_image_url, is_web_visible, is_stitched, uom, is_active)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+		RETURNING id
+	`, in.Name, in.CategoryID, in.Brand, in.Description, in.FabricComposition,
+		in.Pattern, in.Occasion, in.CareInstructions, in.MainImageURL, isWebVisible, isStitched,
+		uom, isActive).Scan(&productID)
+	if err != nil {
+		return "", nil, fmt.Errorf("create product: %w", err)
+	}
+
+	if _, err = tx.Exec(`
+		UPDATE categories SET products_count = products_count + 1 WHERE id = $1
+	`, in.CategoryID); err != nil {
+		return "", nil, fmt.Errorf("update category count: %w", err)
+	}
+	for _, imageURL := range in.GalleryImageURLs {
+		if _, err = tx.Exec(`
+			INSERT INTO product_images (product_id, image_url) VALUES ($1,$2)
+		`, productID, imageURL); err != nil {
+			return "", nil, fmt.Errorf("save product gallery: %w", err)
+		}
+	}
+
+	variants := make([]map[string]interface{}, 0, len(in.Variants))
+	for _, variant := range in.Variants {
+		attributeNames := make([]string, 0, len(variant.AttributeValueIDs))
+		for _, attributeValueID := range variant.AttributeValueIDs {
+			var value string
+			if err = tx.QueryRow(`SELECT value FROM attribute_values WHERE id = $1`, attributeValueID).Scan(&value); err != nil {
+				return "", nil, fmt.Errorf("attribute value %s: %w", attributeValueID, err)
+			}
+			attributeNames = append(attributeNames, strings.TrimSpace(value))
+		}
+		variantNameParts := append([]string{strings.TrimSpace(in.Name)}, attributeNames...)
+		variantName := strings.Join(variantNameParts, " ")
+
+		var variantCode int
+		if err = tx.QueryRow(`SELECT nextval('variant_code_seq')`).Scan(&variantCode); err != nil {
+			return "", nil, fmt.Errorf("generate variant code: %w", err)
+		}
+
+		var sku, barcode string
+		var exists bool
+		for {
+			randomSuffix, randomErr := randomDigits(3)
+			if randomErr != nil {
+				return "", nil, fmt.Errorf("generate sku suffix: %w", randomErr)
+			}
+			sku = fmt.Sprintf("%s-%03d-%s", strings.ToUpper(first3(variantName)), variantCode%1000, randomSuffix)
+			barcode, randomErr = generateEAN13()
+			if randomErr != nil {
+				return "", nil, fmt.Errorf("generate barcode: %w", randomErr)
+			}
+			if err = tx.QueryRow(`
+				SELECT EXISTS(SELECT 1 FROM variants WHERE sku = $1 OR barcode = $2)
+			`, sku, barcode).Scan(&exists); err != nil {
+				return "", nil, fmt.Errorf("check generated identifiers: %w", err)
+			}
+			if !exists {
+				break
+			}
+		}
+
+		isActive := true
+		if variant.IsActive != nil {
+			isActive = *variant.IsActive
+		}
+
+		var variantID string
+		err = tx.QueryRow(`
+			INSERT INTO variants
+			(product_id, name, sku, price, cost_price, barcode, variant_code, hsn_code, is_active)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+			RETURNING id
+		`, productID, variantName, sku, variant.Price, variant.CostPrice, barcode,
+			variantCode, variant.HSNCode, isActive).Scan(&variantID)
+		if err != nil {
+			return "", nil, fmt.Errorf("create variant %s: %w", variantName, err)
+		}
+
+		for _, attributeValueID := range variant.AttributeValueIDs {
+			if _, err = tx.Exec(`
+				INSERT INTO variant_attribute_mapping (variant_id, attribute_value_id)
+				VALUES ($1,$2)
+			`, variantID, attributeValueID); err != nil {
+				return "", nil, fmt.Errorf("map attributes for variant %s: %w", variantName, err)
+			}
+		}
+
+		for _, imagePath := range variant.ImagePaths {
+			if _, err = tx.Exec(`
+				INSERT INTO variant_images (variant_id, image_url) VALUES ($1,$2)
+			`, variantID, imagePath); err != nil {
+				return "", nil, fmt.Errorf("save images for variant %s: %w", variantName, err)
+			}
+		}
+
+		variants = append(variants, map[string]interface{}{
+			"id":            variantID,
+			"name":          variantName,
+			"sku":           sku,
+			"barcode":       barcode,
+			"variant_code":  variantCode,
+			"attribute_ids": variant.AttributeValueIDs,
+		})
+	}
+
+	if err = tx.Commit(); err != nil {
+		return "", nil, fmt.Errorf("commit product and variants: %w", err)
+	}
+	return productID, variants, nil
+}
+
+func first3(value string) string {
+	value = strings.ReplaceAll(value, " ", "")
+	if len(value) > 3 {
+		return value[:3]
+	}
+	return value
+}
+
+func randomDigits(length int) (string, error) {
+	var digits strings.Builder
+	for index := 0; index < length; index++ {
+		digit, err := rand.Int(rand.Reader, big.NewInt(10))
+		if err != nil {
+			return "", err
+		}
+		digits.WriteByte(byte('0' + digit.Int64()))
+	}
+	return digits.String(), nil
+}
+
+func generateEAN13() (string, error) {
+	digits, err := randomDigits(12)
+	if err != nil {
+		return "", err
+	}
+
+	sum := 0
+	for index, digit := range digits {
+		value := int(digit - '0')
+		if index%2 == 1 {
+			sum += value * 3
+		} else {
+			sum += value
+		}
+	}
+	checkDigit := (10 - sum%10) % 10
+	return fmt.Sprintf("%s%d", digits, checkDigit), nil
 }
 
 func (s *Store) InsertProductImage(productID, url string) error {

@@ -143,6 +143,30 @@ func (h *Handler) Create(c *fiber.Ctx) error {
 	})
 }
 
+func (h *Handler) CreateWithVariants(c *fiber.Ctx) error {
+	var in CreateProductWithVariantsInput
+	if err := c.BodyParser(&in); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid input"})
+	}
+	if in.Name == "" || in.CategoryID == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "name and category_id are required"})
+	}
+	if len(in.Variants) == 0 {
+		return c.Status(400).JSON(fiber.Map{"error": "at least one variant is required"})
+	}
+
+	productID, variants, err := h.store.CreateProductWithVariants(in)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	return c.Status(201).JSON(fiber.Map{
+		"message":  "product and variants created",
+		"id":       productID,
+		"variants": variants,
+	})
+}
+
 //
 // LIST
 //
