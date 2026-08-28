@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cashfree Sandbox Payment</title>
+    <script src="https://sdk.cashfree.com/js/v3/cashfree.js"></script>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: Arial, sans-serif;
+        background: #f3f6f9;
+        color: #17202a;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+      }
+      main {
+        width: min(560px, calc(100% - 32px));
+        padding: 28px;
+        background: #ffffff;
+        border: 1px solid #d9e1e8;
+        border-radius: 8px;
+        box-shadow: 0 12px 30px rgb(23 32 42 / 10%);
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 24px;
+      }
+      p {
+        color: #52606d;
+      }
+      label {
+        display: block;
+        margin-top: 16px;
+        font-weight: 700;
+      }
+      input {
+        box-sizing: border-box;
+        width: 100%;
+        margin-top: 7px;
+        padding: 11px 12px;
+        border: 1px solid #b8c4ce;
+        border-radius: 5px;
+        font: inherit;
+      }
+      button {
+        width: 100%;
+        margin-top: 24px;
+        padding: 12px;
+        border: 0;
+        border-radius: 5px;
+        background: #1769aa;
+        color: #fff;
+        font: inherit;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: wait;
+      }
+      #status {
+        min-height: 24px;
+        margin-top: 16px;
+        white-space: pre-wrap;
+      }
+      .hint {
+        font-size: 13px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Cashfree Sandbox Payment</h1>
+      <p>
+        Enter a payment session returned by
+        <code>/ecom/payments/initiate</code>.
+      </p>
+
+      <label for="cfOrderId">Cashfree order ID</label>
+      <input id="cfOrderId" value="213890187917248" autocomplete="off" />
+
+      <label for="orderId">ERP order ID</label>
+      <input
+        id="orderId"
+        value="da4b66bb-cd41-4692-90aa-0a62e5c57fb8"
+        autocomplete="off"
+      />
+
+      <label for="paymentSessionId">Payment session ID</label>
+      <input
+        id="paymentSessionId"
+        value="session_cRx0wRhzLYY7JpprQVQbzlbiuE9JY-rUHlBrudMweE8qIil35Z2-6MRl93ZwugiQtU-rVo9Sl6v4obQY6Z13q8G6nyVv78fD-zJhL4BQidsCKoARqWuDZd6ZBAWF2wpaymentpayment"
+        autocomplete="off"
+      />
+
+      <button id="payButton" type="button">Pay with Cashfree Sandbox</button>
+      <div id="status" role="status"></div>
+      <p class="hint">
+        Do not put CASHFREE_SECRET_KEY or payout credentials in this page.
+        Generate a new payment session for each new order or retry.
+      </p>
+    </main>
+
+    <script>
+      const cashfree = Cashfree({ mode: "sandbox" });
+      const payButton = document.getElementById("payButton");
+      const status = document.getElementById("status");
+
+      payButton.addEventListener("click", async () => {
+        const sessionId = document
+          .getElementById("paymentSessionId")
+          .value.trim();
+        const cfOrderId = document.getElementById("cfOrderId").value.trim();
+        const orderId = document.getElementById("orderId").value.trim();
+
+        if (!sessionId) {
+          status.textContent = "Payment session ID is required.";
+          return;
+        }
+
+        payButton.disabled = true;
+        status.textContent = `Opening payment for Cashfree order ${cfOrderId || "(not provided)"}...`;
+
+        try {
+          await cashfree.checkout({
+            paymentSessionId: sessionId,
+            redirectTarget: "_self",
+          });
+        } catch (error) {
+          console.error(error);
+          status.textContent = `Could not open Cashfree Checkout for ERP order ${orderId || "(not provided)"}. Check the browser console.`;
+          payButton.disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>

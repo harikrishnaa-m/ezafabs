@@ -315,6 +315,25 @@ func (s *Store) CreateProductWithVariants(in CreateProductWithVariantsInput) (st
 			return "", nil, fmt.Errorf("create variant %s: %w", variantName, err)
 		}
 
+		if _, err = tx.Exec(`
+			INSERT INTO stocks (variant_id, warehouse_id, quantity, stock_type, updated_at)
+			SELECT $1, id, 0, 'PRODUCT', NOW()
+			FROM warehouses
+			ON CONFLICT (variant_id, warehouse_id) DO NOTHING
+		`, variantID); err != nil {
+			return "", nil, fmt.Errorf("create warehouse stock for variant %s: %w", variantName, err)
+		}
+
+		if isWebVisible {
+			if _, err = tx.Exec(`
+				INSERT INTO online_stocks (variant_id, quantity, updated_at)
+				VALUES ($1, 0, NOW())
+				ON CONFLICT (variant_id) DO NOTHING
+			`, variantID); err != nil {
+				return "", nil, fmt.Errorf("create online stock for variant %s: %w", variantName, err)
+			}
+		}
+
 		for _, attributeValueID := range variant.AttributeValueIDs {
 			if _, err = tx.Exec(`
 				INSERT INTO variant_attribute_mapping (variant_id, attribute_value_id)
