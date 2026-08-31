@@ -24,6 +24,8 @@ type poItemRecord struct {
 	id             string
 	itemName       string
 	productCode    string
+	variantID      string
+	barcode        string
 	hsnCode        string
 	unit           string
 	qty            float64
@@ -32,10 +34,14 @@ type poItemRecord struct {
 	sellingPrice   float64
 	wholesalePrice float64
 	// variant-creation fields
-	category      string
-	categoryID    string
-	productID     string
-	createVariant bool
+	category          string
+	categoryID        string
+	productID         string
+	createVariant     bool
+	batchLot          string
+	size              string
+	color             string
+	attributeValueIDs []string
 }
 
 // Create runs a single DB transaction that creates a Purchase Order, Goods Receipt,
@@ -65,6 +71,11 @@ func (s *Store) Create(in DirectGRNInput, userID string) (*DirectGRNResult, erro
 	}
 	defer tx.Rollback()
 
+	items, err := s.expandItems(tx, in.Items)
+	if err != nil {
+		return nil, err
+	}
+
 	// ─── 1. Create Purchase Order ───────────────────────────────────────────
 	poID := uuid.New().String()
 	poNumber := "PO-" + time.Now().Format("20060102150405")
@@ -82,7 +93,7 @@ func (s *Store) Create(in DirectGRNInput, userID string) (*DirectGRNResult, erro
 	var totalAmount, taxAmount float64
 	var poItems []poItemRecord
 
-	for _, item := range in.Items {
+	for _, item := range items {
 		if item.Quantity <= 0 {
 			return nil, fmt.Errorf("quantity for item %q must be greater than zero", item.ItemName)
 		}
@@ -114,6 +125,7 @@ func (s *Store) Create(in DirectGRNInput, userID string) (*DirectGRNResult, erro
 				 quantity, unit_price, selling_price, wholesale_price,
 				 gst_percent, gst_amount, total_price,
 				 product_code, category, free_qty,
+					 batch_lot,
 				 additional_work, additional_work_amount,
 				 paid_by_user_id, paid_to_supplier_id, cash_amount, credit_amount,
 				 tax_inclusive)
@@ -122,14 +134,16 @@ func (s *Store) Create(in DirectGRNInput, userID string) (*DirectGRNResult, erro
 				 $7, $8, $9, $10,
 				 $11, $12, $13,
 				 $14, $15, $16,
-				 $17, $18,
-				 NULLIF($19,'')::uuid, NULLIF($20,'')::uuid, $21, $22,
-				 $23)
+					 $17,
+					 $18, $19,
+					 NULLIF($20,'')::uuid, NULLIF($21,'')::uuid, $22, $23,
+					 $24)
 		`,
 			itemID, poID, item.ItemName, item.Description, item.HSNCode, item.Unit,
 			item.Quantity, item.UnitPrice, item.SellingPrice, item.WholesalePrice,
 			item.GSTPercent, gstAmt, lineTotal,
 			item.ProductCode, item.Category, item.FreeQty,
+			item.BatchLot,
 			item.AdditionalWork, item.AdditionalWorkAmount,
 			item.PaidByUserID, item.PaidToSupplierID, item.CashAmount, item.CreditAmount,
 			in.TaxInclusive,
@@ -139,20 +153,26 @@ func (s *Store) Create(in DirectGRNInput, userID string) (*DirectGRNResult, erro
 		}
 
 		poItems = append(poItems, poItemRecord{
-			id:             itemID,
-			itemName:       item.ItemName,
-			productCode:    item.ProductCode,
-			hsnCode:        item.HSNCode,
-			unit:           item.Unit,
-			qty:            item.Quantity,
-			unitPrice:      item.UnitPrice,
-			sellingPrice:   item.SellingPrice,
-			wholesalePrice: item.WholesalePrice,
-			gstPercent:     item.GSTPercent,
-			category:       item.Category,
-			categoryID:     item.CategoryID,
-			productID:      item.ProductID,
-			createVariant:  item.CreateVariant,
+			id:                itemID,
+			itemName:          item.ItemName,
+			productCode:       item.ProductCode,
+			variantID:         item.VariantID,
+			barcode:           item.Barcode,
+			hsnCode:           item.HSNCode,
+			unit:              item.Unit,
+			qty:               item.Quantity,
+			unitPrice:         item.UnitPrice,
+			sellingPrice:      item.SellingPrice,
+			wholesalePrice:    item.WholesalePrice,
+			gstPercent:        item.GSTPercent,
+			category:          item.Category,
+			categoryID:        item.CategoryID,
+			productID:         item.ProductID,
+			createVariant:     item.CreateVariant,
+			batchLot:          item.BatchLot,
+			size:              item.Size,
+			color:             item.Color,
+			attributeValueIDs: item.AttributeValueIDs,
 		})
 	}
 
@@ -270,35 +290,51 @@ func (s *Store) Create(in DirectGRNInput, userID string) (*DirectGRNResult, erro
 
 			// Determine variant_code: use product_code (numeric) if provided, else nextval.
 			var variantID string
-			sku := "V-" + uuid.New().String()[:8]
+			sku, err := s.generateVariantSKUTx(tx, productID, it)
+			if err != nil {
+				return nil, err
+			}
+			barcode := it.barcode
+			if barcode == "" || strings.EqualFold(barcode, "AUTO") {
+				barcode = sku
+			}
 			if it.productCode != "" {
 				vc, parseErr := strconv.Atoi(it.productCode)
 				if parseErr != nil {
 					return nil, fmt.Errorf("product_code %q is not a valid integer variant code", it.productCode)
 				}
-				variantName := fmt.Sprintf("%s %s", it.productCode, it.itemName)
+				variantName, err := s.generateVariantNameTx(tx, productID, it)
+				if err != nil {
+					return nil, err
+				}
 				err = tx.QueryRow(`
 					INSERT INTO variants
-						(product_id, variant_code, name, sku, price, cost_price, wholesale_price, hsn_code, is_active, created_at, updated_at)
-					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, NOW(), NOW())
+						(product_id, variant_code, name, sku, price, cost_price, wholesale_price, barcode, hsn_code, is_active, created_at, updated_at)
+					VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF($8, ''), $9, true, NOW(), NOW())
 					RETURNING id::text
-				`, productID, vc, variantName, sku, it.sellingPrice, it.unitPrice, it.wholesalePrice, it.hsnCode).Scan(&variantID)
+				`, productID, vc, variantName, sku, it.sellingPrice, it.unitPrice, it.wholesalePrice, barcode, it.hsnCode).Scan(&variantID)
 			} else {
 				// Fetch nextval first so we can include it in the name
 				var nextVC int64
 				if err = tx.QueryRow(`SELECT nextval('variant_code_seq')`).Scan(&nextVC); err != nil {
 					return nil, fmt.Errorf("nextval variant_code_seq: %w", err)
 				}
-				variantName := fmt.Sprintf("%d %s", nextVC, it.itemName)
+				variantName, err := s.generateVariantNameTx(tx, productID, it)
+				if err != nil {
+					return nil, err
+				}
 				err = tx.QueryRow(`
 					INSERT INTO variants
-						(product_id, variant_code, name, sku, price, cost_price, wholesale_price, hsn_code, is_active, created_at, updated_at)
-					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, NOW(), NOW())
+						(product_id, variant_code, name, sku, price, cost_price, wholesale_price, barcode, hsn_code, is_active, created_at, updated_at)
+					VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF($8, ''), $9, true, NOW(), NOW())
 					RETURNING id::text
-				`, productID, nextVC, variantName, sku, it.sellingPrice, it.unitPrice, it.wholesalePrice, it.hsnCode).Scan(&variantID)
+				`, productID, nextVC, variantName, sku, it.sellingPrice, it.unitPrice, it.wholesalePrice, barcode, it.hsnCode).Scan(&variantID)
 			}
 			if err != nil {
 				return nil, fmt.Errorf("insert variant for %q: %w", it.itemName, err)
+			}
+			if err = s.addVariantAttributesTx(tx, variantID, it.attributeValueIDs, it.size, it.color); err != nil {
+				return nil, err
 			}
 
 			_, err = tx.Exec(`
@@ -319,10 +355,14 @@ func (s *Store) Create(in DirectGRNInput, userID string) (*DirectGRNResult, erro
 			if err != nil {
 				return nil, fmt.Errorf("insert stock_movements: %w", err)
 			}
-		} else if it.productCode != "" {
+		} else if it.variantID != "" || it.productCode != "" {
 			// product_code is treated as a variant code — the variant MUST exist.
-			var variantID string
-			err = tx.QueryRow(`SELECT id::text FROM variants WHERE variant_code::text = $1 AND is_active = true LIMIT 1`, it.productCode).Scan(&variantID)
+			variantID := it.variantID
+			if variantID != "" {
+				err = tx.QueryRow(`SELECT id::text FROM variants WHERE id::text = $1 AND is_active = true`, variantID).Scan(&variantID)
+			} else {
+				err = tx.QueryRow(`SELECT id::text FROM variants WHERE variant_code::text = $1 AND is_active = true LIMIT 1`, it.productCode).Scan(&variantID)
+			}
 			if err != nil {
 				return nil, fmt.Errorf("no active product variant found with code %s — please create the product and variant in the catalog first", it.productCode)
 			}
@@ -460,6 +500,276 @@ func (s *Store) Create(in DirectGRNInput, userID string) (*DirectGRNResult, erro
 		InvoiceNumber: invoiceNumber,
 		NetAmount:     netAmount,
 	}, nil
+}
+
+func (s *Store) expandItems(tx *sql.Tx, items []DirectGRNItem) ([]DirectGRNItem, error) {
+	var expanded []DirectGRNItem
+	for _, item := range items {
+		if len(item.Variants) == 0 {
+			switch strings.ToLower(strings.TrimSpace(item.Mode)) {
+			case "existing_variant":
+				if item.VariantID == "" && item.ProductCode == "" {
+					return nil, fmt.Errorf("variant_id or product_code is required for existing_variant")
+				}
+				item.CreateVariant = false
+			case "existing_product_new_variant":
+				if item.ProductID == "" {
+					return nil, fmt.Errorf("product_id is required for existing_product_new_variant")
+				}
+				if item.VariantID != "" {
+					return nil, fmt.Errorf("variant_id must be empty for existing_product_new_variant")
+				}
+				item.CreateVariant = true
+			case "new_product":
+				if item.VariantID != "" {
+					return nil, fmt.Errorf("variant_id must be empty for new_product")
+				}
+				item.CreateVariant = true
+			}
+			expanded = append(expanded, item)
+			continue
+		}
+
+		mode := strings.ToLower(strings.TrimSpace(item.Mode))
+		productID := item.ProductID
+		if mode == "existing_product_new_variant" && productID == "" {
+			return nil, fmt.Errorf("product_id is required for existing_product_new_variant")
+		}
+		if (mode == "existing_product_new_variant" || mode == "new_product") && func() bool {
+			for _, variant := range item.Variants {
+				if variant.VariantID != "" {
+					return true
+				}
+			}
+			return false
+		}() {
+			return nil, fmt.Errorf("variant_id must be empty when creating variants")
+		}
+		if mode == "new_product" || (mode == "" && productID == "") {
+			var err error
+			productID, err = s.createProductTx(tx, item)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		productName := item.ProductName
+		if productName == "" {
+			productName = item.ItemName
+		}
+		for _, variant := range item.Variants {
+			variantName := variant.Name
+			if variantName == "" && len(variant.AttributeValueIDs) > 0 {
+				var values []string
+				for _, attributeValueID := range variant.AttributeValueIDs {
+					var value string
+					if err := tx.QueryRow(`SELECT value FROM attribute_values WHERE id = $1 AND is_active = true`, attributeValueID).Scan(&value); err != nil {
+						return nil, fmt.Errorf("resolve attribute value %q: %w", attributeValueID, err)
+					}
+					values = append(values, value)
+				}
+				variantName = strings.Join(values, " / ")
+			}
+			if variantName == "" {
+				variantName = strings.TrimSpace(strings.Join([]string{variant.Size, variant.Color}, " / "))
+			}
+			if variantName == "" {
+				variantName = productName
+			}
+			unit := variant.Unit
+			if unit == "" {
+				unit = item.UOM
+			}
+			if unit == "" {
+				unit = "Unit"
+			}
+			expanded = append(expanded, DirectGRNItem{
+				Mode: mode, ItemName: variantName, ProductName: productName,
+				ProductCode: variant.ProductCode, ProductID: productID, VariantID: variant.VariantID,
+				Category: item.Category, CategoryID: item.CategoryID, Brand: item.Brand, UOM: item.UOM,
+				Size: variant.Size, Color: variant.Color, Barcode: variant.Barcode, BatchLot: variant.BatchLot,
+				AttributeValueIDs: variant.AttributeValueIDs,
+				CreateVariant:     mode != "existing_variant" && variant.VariantID == "",
+				HSNCode:           variant.HSNCode, Unit: unit, Quantity: variant.Quantity,
+				UnitPrice: variant.UnitPrice, SellingPrice: variant.SellingPrice,
+				WholesalePrice: variant.WholesalePrice, GSTPercent: variant.GSTPercent,
+			})
+		}
+	}
+	return expanded, nil
+}
+
+func (s *Store) createProductTx(tx *sql.Tx, item DirectGRNItem) (string, error) {
+	categoryID := item.CategoryID
+	if categoryID == "" {
+		categoryName := strings.TrimSpace(item.Category)
+		if categoryName == "" {
+			categoryName = "Uncategorised"
+		}
+		if err := tx.QueryRow(`
+			INSERT INTO categories (name) VALUES ($1)
+			ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+			RETURNING id
+		`, categoryName).Scan(&categoryID); err != nil {
+			return "", fmt.Errorf("upsert category %q: %w", categoryName, err)
+		}
+	}
+	productName := item.ProductName
+	if productName == "" {
+		productName = item.ItemName
+	}
+	var productID string
+	err := tx.QueryRow(`
+		SELECT id::text FROM products
+		WHERE name = $1 AND category_id = $2 AND is_active = true
+		LIMIT 1
+	`, productName, categoryID).Scan(&productID)
+	if err == nil {
+		return productID, nil
+	}
+	if err != sql.ErrNoRows {
+		return "", fmt.Errorf("find product %q: %w", productName, err)
+	}
+	productID = uuid.New().String()
+	_, err = tx.Exec(`
+		INSERT INTO products (id, name, category_id, brand, uom, is_active, created_at, updated_at)
+		VALUES ($1, $2, $3, NULLIF($4, ''), COALESCE(NULLIF($5, ''), 'Unit'), true, NOW(), NOW())
+	`, productID, productName, categoryID, item.Brand, item.UOM)
+	if err != nil {
+		return "", fmt.Errorf("insert product %q: %w", productName, err)
+	}
+	if _, err = tx.Exec(`UPDATE categories SET products_count = products_count + 1 WHERE id = $1`, categoryID); err != nil {
+		return "", fmt.Errorf("increment products_count for category %q: %w", categoryID, err)
+	}
+	return productID, nil
+}
+
+func (s *Store) generateVariantSKUTx(tx *sql.Tx, productID string, item poItemRecord) (string, error) {
+	var brand, productName string
+	if err := tx.QueryRow(`SELECT COALESCE(brand, ''), name FROM products WHERE id = $1`, productID).Scan(&brand, &productName); err != nil {
+		return "", fmt.Errorf("resolve product for SKU: %w", err)
+	}
+
+	parts := []string{brand, productName}
+	if len(item.attributeValueIDs) > 0 {
+		for _, attributeValueID := range item.attributeValueIDs {
+			var value string
+			if err := tx.QueryRow(`SELECT value FROM attribute_values WHERE id = $1 AND is_active = true`, attributeValueID).Scan(&value); err != nil {
+				return "", fmt.Errorf("resolve attribute value %q for SKU: %w", attributeValueID, err)
+			}
+			parts = append(parts, value)
+		}
+	} else {
+		parts = append(parts, item.size, item.color)
+	}
+	base := readableSKU(parts...)
+	if base == "" {
+		base = "VARIANT"
+	}
+	for suffix := 1; ; suffix++ {
+		sku := base
+		if suffix > 1 {
+			sku = fmt.Sprintf("%s-%d", base, suffix)
+		}
+		var exists bool
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM variants WHERE sku = $1)`, sku).Scan(&exists); err != nil {
+			return "", fmt.Errorf("check SKU %q: %w", sku, err)
+		}
+		if !exists {
+			return sku, nil
+		}
+	}
+}
+
+func (s *Store) generateVariantNameTx(tx *sql.Tx, productID string, item poItemRecord) (string, error) {
+	var brand, productName string
+	if err := tx.QueryRow(`SELECT COALESCE(brand, ''), name FROM products WHERE id = $1`, productID).Scan(&brand, &productName); err != nil {
+		return "", fmt.Errorf("resolve product for variant name: %w", err)
+	}
+
+	parts := []string{brand, productName}
+	if len(item.attributeValueIDs) > 0 {
+		for _, attributeValueID := range item.attributeValueIDs {
+			var value string
+			if err := tx.QueryRow(`SELECT value FROM attribute_values WHERE id = $1 AND is_active = true`, attributeValueID).Scan(&value); err != nil {
+				return "", fmt.Errorf("resolve attribute value %q for variant name: %w", attributeValueID, err)
+			}
+			parts = append(parts, value)
+		}
+	} else {
+		parts = append(parts, item.color, item.size)
+	}
+
+	name := strings.TrimSpace(strings.Join(parts, " "))
+	if name == "" {
+		name = item.itemName
+	}
+	return name, nil
+}
+
+func readableSKU(parts ...string) string {
+	var components []string
+	for _, part := range parts {
+		var words []string
+		for _, word := range strings.FieldsFunc(strings.ToUpper(strings.TrimSpace(part)), func(character rune) bool {
+			return !((character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9'))
+		}) {
+			if len(words) == 2 {
+				break
+			}
+			if len(word) > 3 {
+				word = word[:3]
+			}
+			words = append(words, word)
+		}
+		if len(words) > 0 {
+			components = append(components, strings.Join(words, "-"))
+		}
+	}
+	return strings.Trim(strings.Join(components, "-"), "-")
+}
+
+func (s *Store) addVariantAttributesTx(tx *sql.Tx, variantID string, attributeValueIDs []string, size, color string) error {
+	if len(attributeValueIDs) > 0 {
+		for _, attributeValueID := range attributeValueIDs {
+			var value string
+			if err := tx.QueryRow(`SELECT value FROM attribute_values WHERE id = $1 AND is_active = true`, attributeValueID).Scan(&value); err != nil {
+				return fmt.Errorf("resolve attribute value %q: %w", attributeValueID, err)
+			}
+			if _, err := tx.Exec(`INSERT INTO variant_attribute_mapping (variant_id, attribute_value_id) VALUES ($1, $2)`, variantID, attributeValueID); err != nil {
+				return fmt.Errorf("map attribute value %q: %w", attributeValueID, err)
+			}
+		}
+		return nil
+	}
+
+	for attributeName, value := range map[string]string{"Size": size, "Color": color} {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		var attributeID, valueID string
+		err := tx.QueryRow(`SELECT id::text FROM attributes WHERE name = $1 AND is_active = true LIMIT 1`, attributeName).Scan(&attributeID)
+		if err == sql.ErrNoRows {
+			if err = tx.QueryRow(`INSERT INTO attributes (name) VALUES ($1) RETURNING id::text`, attributeName).Scan(&attributeID); err != nil {
+				return fmt.Errorf("create %s attribute: %w", attributeName, err)
+			}
+		} else if err != nil {
+			return fmt.Errorf("find %s attribute: %w", attributeName, err)
+		}
+		err = tx.QueryRow(`SELECT id::text FROM attribute_values WHERE attribute_id = $1 AND value = $2 AND is_active = true LIMIT 1`, attributeID, value).Scan(&valueID)
+		if err == sql.ErrNoRows {
+			if err = tx.QueryRow(`INSERT INTO attribute_values (attribute_id, value) VALUES ($1, $2) RETURNING id::text`, attributeID, value).Scan(&valueID); err != nil {
+				return fmt.Errorf("create %s value %q: %w", attributeName, value, err)
+			}
+		} else if err != nil {
+			return fmt.Errorf("find %s value %q: %w", attributeName, value, err)
+		}
+		if _, err = tx.Exec(`INSERT INTO variant_attribute_mapping (variant_id, attribute_value_id) VALUES ($1, $2)`, variantID, valueID); err != nil {
+			return fmt.Errorf("map %s value %q: %w", attributeName, value, err)
+		}
+	}
+	return nil
 }
 
 // NextVariantCode returns MAX(variant_code)+1, which is a safe next code to use.
@@ -664,6 +974,7 @@ func (s *Store) GetByID(grnID string) (*DirectGRNDetail, error) {
 		SELECT
 			poi.id, poi.item_name, COALESCE(poi.description, ''),
 			COALESCE(poi.product_code, ''), COALESCE(poi.category, ''),
+			COALESCE(poi.batch_lot, ''),
 			COALESCE(poi.hsn_code, ''), COALESCE(poi.unit, ''),
 			poi.quantity, poi.free_qty, poi.unit_price,
 			COALESCE(poi.selling_price, 0), COALESCE(poi.wholesale_price, 0),
@@ -689,6 +1000,7 @@ func (s *Store) GetByID(grnID string) (*DirectGRNDetail, error) {
 		if err := itemRows.Scan(
 			&it.ID, &it.ItemName, &it.Description,
 			&it.ProductCode, &it.Category,
+			&it.BatchLot,
 			&it.HSNCode, &it.Unit,
 			&it.Quantity, &it.FreeQty, &it.UnitPrice,
 			&it.SellingPrice, &it.WholesalePrice,

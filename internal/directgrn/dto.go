@@ -2,17 +2,28 @@ package directgrn
 
 // DirectGRNItem represents one line item in a Direct GRN.
 type DirectGRNItem struct {
-	ItemName    string `json:"item_name"`
-	Description string `json:"description"`
-	ProductCode string `json:"product_code"`
-	Category    string `json:"category"`
+	Mode              string             `json:"mode"` // existing_variant, existing_product_new_variant, or new_product
+	ItemName          string             `json:"item_name"`
+	ProductName       string             `json:"product_name"`
+	Description       string             `json:"description"`
+	ProductCode       string             `json:"product_code"`
+	ProductID         string             `json:"product_id"`
+	VariantID         string             `json:"variant_id"`
+	Category          string             `json:"category"`
+	Brand             string             `json:"brand"`
+	UOM               string             `json:"uom"`
+	Size              string             `json:"size"`
+	Color             string             `json:"color"`
+	Barcode           string             `json:"barcode"`
+	BatchLot          string             `json:"batch_lot"`
+	AttributeValueIDs []string           `json:"attribute_value_ids,omitempty"`
+	Variants          []DirectGRNVariant `json:"variants,omitempty"`
 	// CategoryID and ProductID identify existing catalog entities.
 	// When CreateVariant is true a new variant is created:
 	//   – if ProductID is set, the variant is added under that product;
 	//   – otherwise the category (by CategoryID or Category name) and product
 	//     (by ItemName) are upserted and then the variant is created under them.
 	CategoryID           string  `json:"category_id"`
-	ProductID            string  `json:"product_id"`
 	CreateVariant        bool    `json:"create_variant"`
 	HSNCode              string  `json:"hsn_code"`
 	Unit                 string  `json:"unit"`
@@ -28,6 +39,25 @@ type DirectGRNItem struct {
 	PaidToSupplierID     string  `json:"paid_to_supplier_id"`
 	CashAmount           float64 `json:"cash_amount"`
 	CreditAmount         float64 `json:"credit_amount"`
+}
+
+// DirectGRNVariant is a variant row used by the new-product and existing-product modes.
+type DirectGRNVariant struct {
+	VariantID         string   `json:"variant_id"`
+	Name              string   `json:"name"`
+	Size              string   `json:"size"`
+	Color             string   `json:"color"`
+	Barcode           string   `json:"barcode"`
+	ProductCode       string   `json:"product_code"`
+	HSNCode           string   `json:"hsn_code"`
+	Unit              string   `json:"unit"`
+	Quantity          float64  `json:"quantity"`
+	UnitPrice         float64  `json:"unit_price"`
+	SellingPrice      float64  `json:"selling_price"`
+	WholesalePrice    float64  `json:"wholesale_price"`
+	GSTPercent        float64  `json:"gst_percent"`
+	BatchLot          string   `json:"batch_lot"`
+	AttributeValueIDs []string `json:"attribute_value_ids,omitempty"`
 }
 
 // DirectGRNCharge represents an extra charge (freight, coolie, handling, etc.).
@@ -109,6 +139,7 @@ type DirectGRNDetailItem struct {
 	Description          string  `json:"description"`
 	ProductCode          string  `json:"product_code"`
 	Category             string  `json:"category"`
+	BatchLot             string  `json:"batch_lot"`
 	HSNCode              string  `json:"hsn_code"`
 	Unit                 string  `json:"unit"`
 	Quantity             float64 `json:"quantity"`
