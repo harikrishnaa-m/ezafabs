@@ -40,8 +40,8 @@ func (s *Store) Get(supplierID, dateFrom, dateTo string) (*StatementResponse, er
 	// ── 2. Opening balance (all debits - all credits BEFORE dateFrom) ──────
 	var openingInvoiced, openingPaid, openingReturned float64
 	s.db.QueryRow(`
-		SELECT COALESCE(SUM(net_amount), 0)
-		FROM purchase_invoices
+		SELECT COALESCE(SUM(pi.net_amount + COALESCE((SELECT SUM(pc.amount) FROM purchase_charges pc WHERE pc.purchase_order_id = pi.purchase_order_id), 0)), 0)
+		FROM purchase_invoices pi
 		WHERE supplier_id = $1 AND invoice_date < $2::date
 	`, supplierID, dateFrom).Scan(&openingInvoiced)
 
@@ -66,7 +66,7 @@ func (s *Store) Get(supplierID, dateFrom, dateTo string) (*StatementResponse, er
 			pi.id::text,
 			TO_CHAR(pi.invoice_date, 'DD/MM/YYYY'),
 			COALESCE(pi.invoice_number, ''),
-			COALESCE(pi.net_amount, 0),
+			COALESCE(pi.net_amount, 0) + COALESCE((SELECT SUM(pc.amount) FROM purchase_charges pc WHERE pc.purchase_order_id = pi.purchase_order_id), 0),
 			COALESCE(pi.notes, ''),
 			COALESCE(w.name, ''),
 			COALESCE(gr.grn_number, '')

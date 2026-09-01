@@ -35,9 +35,9 @@ func (s *Store) Get(dateFrom, dateTo string) (*SupplierAgingResponse, error) {
 			sup.name,
 			COALESCE(po.po_number, ''),
 			COALESCE(b.name, ''),
-			pi.net_amount,
+			pi.net_amount + COALESCE((SELECT SUM(pc.amount) FROM purchase_charges pc WHERE pc.purchase_order_id = pi.purchase_order_id), 0),
 			GREATEST(
-				pi.net_amount
+				pi.net_amount + COALESCE((SELECT SUM(pc.amount) FROM purchase_charges pc WHERE pc.purchase_order_id = pi.purchase_order_id), 0)
 				- COALESCE(pi.paid_amount, 0)
 				- COALESCE((
 					SELECT SUM(pr.net_amount)
@@ -123,10 +123,10 @@ func (s *Store) Get(dateFrom, dateTo string) (*SupplierAgingResponse, error) {
 	var totalOpeningAllTime, totalPendingAllTime float64
 	_ = s.db.QueryRow(`
 		SELECT
-			COALESCE(SUM(net_amount), 0),
+			COALESCE(SUM(net_amount + COALESCE((SELECT SUM(pc.amount) FROM purchase_charges pc WHERE pc.purchase_order_id = pi.purchase_order_id), 0)), 0),
 			COALESCE(SUM(
 				GREATEST(
-					net_amount
+					net_amount + COALESCE((SELECT SUM(pc.amount) FROM purchase_charges pc WHERE pc.purchase_order_id = pi.purchase_order_id), 0)
 					- COALESCE(paid_amount, 0)
 					- COALESCE((SELECT SUM(pr.net_amount) FROM purchase_returns pr WHERE pr.purchase_invoice_id = pi.id), 0),
 					0
@@ -139,16 +139,16 @@ func (s *Store) Get(dateFrom, dateTo string) (*SupplierAgingResponse, error) {
 	_ = s.db.QueryRow(`
 		SELECT
 			COALESCE(SUM(CASE WHEN (DATE($1) - invoice_date::date) < 7 THEN
-				GREATEST(net_amount - COALESCE(paid_amount,0) - COALESCE((SELECT SUM(pr.net_amount) FROM purchase_returns pr WHERE pr.purchase_invoice_id = pi.id),0), 0)
+				GREATEST(net_amount + COALESCE((SELECT SUM(pc.amount) FROM purchase_charges pc WHERE pc.purchase_order_id = pi.purchase_order_id), 0) - COALESCE(paid_amount,0) - COALESCE((SELECT SUM(pr.net_amount) FROM purchase_returns pr WHERE pr.purchase_invoice_id = pi.id),0), 0)
 			ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN (DATE($1) - invoice_date::date) BETWEEN 7 AND 15 THEN
-				GREATEST(net_amount - COALESCE(paid_amount,0) - COALESCE((SELECT SUM(pr.net_amount) FROM purchase_returns pr WHERE pr.purchase_invoice_id = pi.id),0), 0)
+				GREATEST(net_amount + COALESCE((SELECT SUM(pc.amount) FROM purchase_charges pc WHERE pc.purchase_order_id = pi.purchase_order_id), 0) - COALESCE(paid_amount,0) - COALESCE((SELECT SUM(pr.net_amount) FROM purchase_returns pr WHERE pr.purchase_invoice_id = pi.id),0), 0)
 			ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN (DATE($1) - invoice_date::date) BETWEEN 16 AND 31 THEN
-				GREATEST(net_amount - COALESCE(paid_amount,0) - COALESCE((SELECT SUM(pr.net_amount) FROM purchase_returns pr WHERE pr.purchase_invoice_id = pi.id),0), 0)
+				GREATEST(net_amount + COALESCE((SELECT SUM(pc.amount) FROM purchase_charges pc WHERE pc.purchase_order_id = pi.purchase_order_id), 0) - COALESCE(paid_amount,0) - COALESCE((SELECT SUM(pr.net_amount) FROM purchase_returns pr WHERE pr.purchase_invoice_id = pi.id),0), 0)
 			ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN (DATE($1) - invoice_date::date) > 31 THEN
-				GREATEST(net_amount - COALESCE(paid_amount,0) - COALESCE((SELECT SUM(pr.net_amount) FROM purchase_returns pr WHERE pr.purchase_invoice_id = pi.id),0), 0)
+				GREATEST(net_amount + COALESCE((SELECT SUM(pc.amount) FROM purchase_charges pc WHERE pc.purchase_order_id = pi.purchase_order_id), 0) - COALESCE(paid_amount,0) - COALESCE((SELECT SUM(pr.net_amount) FROM purchase_returns pr WHERE pr.purchase_invoice_id = pi.id),0), 0)
 			ELSE 0 END), 0)
 		FROM purchase_invoices pi
 	`, dateTo).Scan(&totalUnder7AllTime, &totalD7to15AllTime, &totalD15to31AllTime, &totalOver31AllTime)

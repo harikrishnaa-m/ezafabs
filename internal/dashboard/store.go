@@ -54,14 +54,14 @@ func (s *Store) GetKPISummary(from, to string) (*KPISummary, error) {
 	s.db.QueryRow(salesQ, args...).Scan(&kpi.SalesInvoiceCount, &kpi.TotalSales)
 
 	// Purchase totals (reuse date filter with same args)
-	purchaseQ := "SELECT COALESCE(COUNT(*),0), COALESCE(SUM(net_amount),0) FROM purchase_invoices WHERE status != 'CANCELLED'" + dateFilter
+	purchaseQ := "SELECT COALESCE(COUNT(*),0), COALESCE(SUM(net_amount + COALESCE((SELECT SUM(pc.amount) FROM purchase_charges pc WHERE pc.purchase_order_id = purchase_invoices.purchase_order_id),0)),0) FROM purchase_invoices WHERE status != 'CANCELLED'" + dateFilter
 	s.db.QueryRow(purchaseQ, args...).Scan(&kpi.PurchaseInvoiceCount, &kpi.TotalPurchases)
 
 	// Receivables (all-time outstanding)
 	s.db.QueryRow("SELECT COALESCE(SUM(net_amount - paid_amount),0) FROM sales_invoices WHERE status IN ('UNPAID','PARTIAL')").Scan(&kpi.TotalReceivables)
 
 	// Payables (all-time outstanding)
-	s.db.QueryRow("SELECT COALESCE(SUM(net_amount - paid_amount),0) FROM purchase_invoices WHERE status IN ('PENDING','PARTIALLY_PAID')").Scan(&kpi.TotalPayables)
+	s.db.QueryRow("SELECT COALESCE(SUM(net_amount + COALESCE((SELECT SUM(pc.amount) FROM purchase_charges pc WHERE pc.purchase_order_id = purchase_invoices.purchase_order_id),0) - paid_amount),0) FROM purchase_invoices WHERE status IN ('PENDING','PARTIALLY_PAID')").Scan(&kpi.TotalPayables)
 
 	// Counts
 	s.db.QueryRow("SELECT COUNT(*) FROM customers WHERE is_active = TRUE").Scan(&kpi.TotalCustomers)

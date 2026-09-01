@@ -250,13 +250,16 @@ func (r *Recorder) RecordPurchaseInvoice(purchaseInvoiceID, userID string) error
 		ID, InvoiceNumber                string
 		SubAmount, DiscountAmount        float64
 		GSTAmount, NetAmount, PaidAmount float64
+		OtherCharges, RoundOff           float64
 		InvoiceDate                      string
 		BranchID                         sql.NullString
 	}
 	err = r.db.QueryRow(`
 		SELECT pi.id, pi.invoice_number,
 		       pi.sub_amount, pi.discount_amount,
-		       pi.gst_amount, pi.net_amount, pi.paid_amount,
+		       pi.gst_amount, pi.net_amount, pi.paid_amount, pi.round_off,
+		       COALESCE((SELECT SUM(pc.amount) FROM purchase_charges pc
+		                 WHERE pc.purchase_order_id = pi.purchase_order_id), 0),
 		       pi.invoice_date::date,
 		       w.branch_id
 		FROM purchase_invoices pi
@@ -265,26 +268,35 @@ func (r *Recorder) RecordPurchaseInvoice(purchaseInvoiceID, userID string) error
 	`, purchaseInvoiceID).Scan(
 		&inv.ID, &inv.InvoiceNumber,
 		&inv.SubAmount, &inv.DiscountAmount,
-		&inv.GSTAmount, &inv.NetAmount, &inv.PaidAmount, &inv.InvoiceDate,
+		&inv.GSTAmount, &inv.NetAmount, &inv.PaidAmount, &inv.RoundOff,
+		&inv.OtherCharges, &inv.InvoiceDate,
 		&inv.BranchID,
 	)
 	if err != nil {
 		return fmt.Errorf("read purchase invoice: %w", err)
 	}
 
+	effectiveNet := inv.NetAmount + inv.OtherCharges
 	lines := []VoucherLine{
-		{LedgerAccountID: LedgerPurchaseExpense, Debit: inv.SubAmount, Narration: "Purchase cost"},
-		{LedgerAccountID: LedgerAccountsPayable, Credit: inv.NetAmount, Narration: "Supplier payable"},
+		{LedgerAccountID: LedgerPurchaseExpense, Debit: inv.SubAmount + inv.OtherCharges, Narration: "Purchase cost and charges"},
+		{LedgerAccountID: LedgerAccountsPayable, Credit: effectiveNet, Narration: "Supplier payable"},
 	}
 	if inv.GSTAmount > 0 {
 		lines = append(lines, VoucherLine{
 			LedgerAccountID: LedgerGSTReceivable, Debit: inv.GSTAmount, Narration: "Input GST credit",
 		})
 	}
-	if inv.DiscountAmount > 0 {
+	// Direct GRN stores sub_amount after discount; older purchase invoices store
+	// the pre-discount subtotal. Detect the two representations before posting.
+	if inv.DiscountAmount > 0 && math.Abs(inv.NetAmount-(inv.SubAmount+inv.GSTAmount+inv.RoundOff)) > 0.01 {
 		lines = append(lines, VoucherLine{
 			LedgerAccountID: LedgerDiscountReceived, Credit: inv.DiscountAmount, Narration: "Discount from supplier",
 		})
+	}
+	if inv.RoundOff > 0 {
+		lines = append(lines, VoucherLine{LedgerAccountID: LedgerRoundOff, Debit: inv.RoundOff, Narration: "Purchase round-off"})
+	} else if inv.RoundOff < 0 {
+		lines = append(lines, VoucherLine{LedgerAccountID: LedgerRoundOff, Credit: -inv.RoundOff, Narration: "Purchase round-off"})
 	}
 
 	// Record inline payment at invoice creation

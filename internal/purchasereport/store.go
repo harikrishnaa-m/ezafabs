@@ -24,6 +24,7 @@ func (s *Store) List(f Filter) (*ReportResult, error) {
 		page = 1
 	}
 	offset := (page - 1) * limit
+	effectiveNet := "COALESCE(pi.net_amount,0) + COALESCE((SELECT SUM(pc.amount) FROM purchase_charges pc WHERE pc.purchase_order_id = pi.purchase_order_id),0)"
 
 	// ── base FROM + SELECT ─────────────────────────────────────────────────
 	base := `
@@ -91,7 +92,7 @@ func (s *Store) List(f Filter) (*ReportResult, error) {
 		idx++
 	}
 	if f.SearchNetAmount != "" {
-		conditions = append(conditions, fmt.Sprintf("COALESCE(pi.net_amount,0)::text LIKE $%d", idx))
+		conditions = append(conditions, fmt.Sprintf("(%s)::text LIKE $%d", effectiveNet, idx))
 		args = append(args, "%"+f.SearchNetAmount+"%")
 		idx++
 	}
@@ -123,7 +124,7 @@ func (s *Store) List(f Filter) (*ReportResult, error) {
 			), 0),
 			COALESCE(SUM(pi.gst_amount), 0),
 			COALESCE(SUM(pi.discount_amount), 0),
-			COALESCE(SUM(pi.net_amount), 0)
+			COALESCE(SUM(` + effectiveNet + `), 0)
 	` + base + where
 
 	var t Totals
@@ -147,7 +148,7 @@ func (s *Store) List(f Filter) (*ReportResult, error) {
 			COALESCE((SELECT SUM(pc.amount) FROM purchase_charges pc WHERE pc.purchase_order_id = pi.purchase_order_id), 0),
 			COALESCE(pi.gst_amount, 0),
 			COALESCE(pi.discount_amount, 0),
-			COALESCE(pi.net_amount, 0),
+			` + effectiveNet + `,
 			COALESCE(pi.warehouse_id::text, ''),
 			COALESCE(w.name, '')
 	`
