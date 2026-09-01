@@ -25,6 +25,29 @@ func NewStore(db *sql.DB) *Store {
 	return &Store{db: db}
 }
 
+func (s *Store) InvoiceID(jobOrderID string) (string, error) {
+	var id string
+	err := s.db.QueryRow(`SELECT id FROM job_invoices WHERE job_order_id = $1`, jobOrderID).Scan(&id)
+	return id, err
+}
+
+func (s *Store) PaymentIDs(jobOrderID string) ([]string, error) {
+	rows, err := s.db.Query(`SELECT id FROM job_order_payments WHERE job_order_id = $1 ORDER BY paid_at, id`, jobOrderID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // ──────────────────────────────────────────
 // Create
 // ──────────────────────────────────────────

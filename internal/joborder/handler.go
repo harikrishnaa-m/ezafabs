@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 
+	"defab-erp/internal/accounting"
 	"defab-erp/internal/core/httperr"
 	"defab-erp/internal/core/model"
 	"defab-erp/internal/core/storage"
@@ -15,11 +16,12 @@ import (
 )
 
 type Handler struct {
-	store *Store
+	store    *Store
+	recorder *accounting.Recorder
 }
 
-func NewHandler(s *Store) *Handler {
-	return &Handler{store: s}
+func NewHandler(s *Store, recorder *accounting.Recorder) *Handler {
+	return &Handler{store: s, recorder: recorder}
 }
 
 func (h *Handler) Create(c *fiber.Ctx) error {
@@ -89,6 +91,9 @@ func (h *Handler) Create(c *fiber.Ctx) error {
 	if err != nil {
 		log.Println("create job order error:", err)
 		return httperr.Internal(c)
+	}
+	if h.recorder != nil {
+		go h.recordJobOrderAccounting(id, user.ID.String())
 	}
 
 	result, err := h.store.GetByID(id)
@@ -201,6 +206,7 @@ func (h *Handler) PushStatus(c *fiber.Ctx) error {
 
 func (h *Handler) AddPayment(c *fiber.Ctx) error {
 	id := c.Params("id")
+	user := c.Locals("user").(*model.User)
 	var in PaymentInput
 	if err := c.BodyParser(&in); err != nil {
 		return httperr.BadRequest(c, "Invalid JSON body")
@@ -215,17 +221,69 @@ func (h *Handler) AddPayment(c *fiber.Ctx) error {
 		log.Println("add job payment error:", err)
 		return httperr.Internal(c)
 	}
+	if h.recorder != nil {
+		go h.recordJobPaymentsAccounting(id, user.ID.String())
+	}
 	return c.Status(http.StatusCreated).JSON(fiber.Map{"message": "payment recorded"})
 }
 
 func (h *Handler) Cancel(c *fiber.Ctx) error {
 	id := c.Params("id")
 	user := c.Locals("user").(*model.User)
+	invoiceID, err := h.store.InvoiceID(id)
+	if err != nil && err != sql.ErrNoRows {
+		log.Println("get job invoice ID error:", err)
+		return httperr.Internal(c)
+	}
+	paymentIDs, err := h.store.PaymentIDs(id)
+	if err != nil {
+		log.Println("get job payment IDs error:", err)
+		return httperr.Internal(c)
+	}
 	if err := h.store.Cancel(id, user.ID.String()); err != nil {
 		log.Println("cancel job order error:", err)
 		return httperr.Internal(c)
 	}
+	if h.recorder != nil {
+		go func() {
+			if invoiceID != "" {
+				if err := h.recorder.CancelVoucherByRef(accounting.RefJobInvoice, invoiceID); err != nil {
+					log.Println("cancel job invoice voucher error:", err)
+				}
+			}
+			for _, paymentID := range paymentIDs {
+				if err := h.recorder.CancelVoucherByRef(accounting.RefJobPayment, paymentID); err != nil {
+					log.Println("cancel job payment voucher error:", err)
+				}
+			}
+		}()
+	}
 	return c.JSON(fiber.Map{"message": "cancelled"})
+}
+
+func (h *Handler) recordJobOrderAccounting(jobOrderID, userID string) {
+	jobInvoiceID, err := h.store.InvoiceID(jobOrderID)
+	if err != nil {
+		log.Println("get job invoice ID for accounting error:", err)
+		return
+	}
+	if err := h.recorder.RecordJobInvoice(jobInvoiceID, userID); err != nil {
+		log.Println("record job invoice voucher error:", err)
+	}
+	h.recordJobPaymentsAccounting(jobOrderID, userID)
+}
+
+func (h *Handler) recordJobPaymentsAccounting(jobOrderID, userID string) {
+	paymentIDs, err := h.store.PaymentIDs(jobOrderID)
+	if err != nil {
+		log.Println("get job payment IDs for accounting error:", err)
+		return
+	}
+	for _, paymentID := range paymentIDs {
+		if err := h.recorder.RecordJobPayment(paymentID, userID); err != nil {
+			log.Println("record job payment voucher error:", err)
+		}
+	}
 }
 
 func (h *Handler) UpdateItemStaff(c *fiber.Ctx) error {

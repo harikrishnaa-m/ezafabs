@@ -382,6 +382,95 @@ func (r *Recorder) RecordSalesPayment(salesPaymentID, userID string) error {
 	})
 }
 
+// RecordJobInvoice records the invoice created for a job order.
+func (r *Recorder) RecordJobInvoice(jobInvoiceID, userID string) error {
+	exists, err := r.store.VoucherExistsForRef(RefJobInvoice, jobInvoiceID)
+	if err != nil {
+		return fmt.Errorf("check existing job invoice voucher: %w", err)
+	}
+	if exists {
+		return nil
+	}
+
+	var inv struct {
+		InvoiceNumber, BranchID                         string
+		SubAmount, DiscountAmount, GSTAmount, NetAmount float64
+		InvoiceDate                                     string
+	}
+	err = r.db.QueryRow(`
+		SELECT invoice_number, COALESCE(branch_id::text, ''), sub_amount,
+		       discount_amount, gst_amount, net_amount, created_at::date
+		FROM job_invoices WHERE id = $1
+	`, jobInvoiceID).Scan(&inv.InvoiceNumber, &inv.BranchID, &inv.SubAmount,
+		&inv.DiscountAmount, &inv.GSTAmount, &inv.NetAmount, &inv.InvoiceDate)
+	if err != nil {
+		return fmt.Errorf("read job invoice: %w", err)
+	}
+
+	lines := []VoucherLine{
+		{LedgerAccountID: LedgerAccountsReceiv, Debit: inv.NetAmount, Narration: "Customer receivable"},
+		{LedgerAccountID: LedgerSalesRevenue, Credit: inv.SubAmount - inv.GSTAmount, Narration: "Job revenue (excl. GST)"},
+	}
+	if inv.GSTAmount > 0 {
+		lines = append(lines, VoucherLine{LedgerAccountID: LedgerGSTPayable, Credit: inv.GSTAmount, Narration: "Output GST"})
+	}
+	if inv.DiscountAmount > 0 {
+		lines = append(lines, VoucherLine{LedgerAccountID: LedgerDiscountAllowed, Debit: inv.DiscountAmount, Narration: "Discount allowed"})
+	}
+
+	return r.store.CreateVoucher(Voucher{
+		VoucherType: VoucherTypeSales,
+		VoucherDate: inv.InvoiceDate,
+		Narration:   "Job Invoice " + inv.InvoiceNumber,
+		RefType:     RefJobInvoice,
+		RefID:       jobInvoiceID,
+		BranchID:    inv.BranchID,
+		CreatedBy:   userID,
+		Lines:       lines,
+	})
+}
+
+// RecordJobPayment records one advance or subsequent payment for a job order.
+func (r *Recorder) RecordJobPayment(jobPaymentID, userID string) error {
+	exists, err := r.store.VoucherExistsForRef(RefJobPayment, jobPaymentID)
+	if err != nil {
+		return fmt.Errorf("check existing job payment voucher: %w", err)
+	}
+	if exists {
+		return nil
+	}
+
+	var payment struct {
+		JobOrderID, Method, PaidAt string
+		Amount                     float64
+	}
+	err = r.db.QueryRow(`
+		SELECT job_order_id, payment_method, amount, paid_at::date
+		FROM job_order_payments WHERE id = $1
+	`, jobPaymentID).Scan(&payment.JobOrderID, &payment.Method, &payment.Amount, &payment.PaidAt)
+	if err != nil {
+		return fmt.Errorf("read job payment: %w", err)
+	}
+
+	var jobNumber string
+	if err := r.db.QueryRow(`SELECT job_number FROM job_orders WHERE id = $1`, payment.JobOrderID).Scan(&jobNumber); err != nil {
+		return fmt.Errorf("read job order for payment: %w", err)
+	}
+
+	return r.store.CreateVoucher(Voucher{
+		VoucherType: VoucherTypeReceipt,
+		VoucherDate: payment.PaidAt,
+		Narration:   "Payment received for Job Order " + jobNumber,
+		RefType:     RefJobPayment,
+		RefID:       jobPaymentID,
+		CreatedBy:   userID,
+		Lines: []VoucherLine{
+			{LedgerAccountID: PaymentLedgerMap(payment.Method), Debit: payment.Amount, Narration: payment.Method + " received"},
+			{LedgerAccountID: LedgerAccountsReceiv, Credit: payment.Amount, Narration: "Receivable settled"},
+		},
+	})
+}
+
 // ════════════════════════════════════════════
 // Supplier Payment → PAYMENT voucher
 // ════════════════════════════════════════════

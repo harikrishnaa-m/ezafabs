@@ -196,7 +196,7 @@ func main() {
 	dashboardHandler := dashboard.NewHandler(dashboardStore)
 
 	jobOrderStore := joborder.NewStore(database)
-	jobOrderHandler := joborder.NewHandler(jobOrderStore)
+	jobOrderHandler := joborder.NewHandler(jobOrderStore, accountingRecorder)
 
 	jobWorkerStore := jobworker.NewStore(database)
 	jobWorkerHandler := jobworker.NewHandler(jobWorkerStore)

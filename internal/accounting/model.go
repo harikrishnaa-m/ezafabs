@@ -18,6 +18,7 @@ const (
 	LedgerPurchaseExpense  = "b0000000-0000-0000-0000-000000000031"
 	LedgerDiscountAllowed  = "b0000000-0000-0000-0000-000000000040"
 	LedgerDiscountReceived = "b0000000-0000-0000-0000-000000000041"
+	LedgerRoundOff         = "b0000000-0000-0000-0000-000000000042"
 )
 
 // Voucher types (Tally vocabulary)
@@ -40,6 +41,8 @@ const (
 	RefSupplierPayment = "supplier_payment"
 	RefSalesReturn     = "sales_return"
 	RefExchange        = "exchange_order"
+	RefJobInvoice      = "job_invoice"
+	RefJobPayment      = "job_payment"
 )
 
 // AccountGroup represents a node in the chart-of-accounts tree.
