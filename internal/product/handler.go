@@ -189,7 +189,9 @@ func (h *Handler) List(c *fiber.Ctx) error {
 		var web, stitched, active bool
 		var cid, cname string
 
-		rows.Scan(&id, &name, &brand, &mainImage, &web, &stitched, &uom, &created, &cid, &cname, &active, &description, &fabricComposition, &pattern, &occasion, &careInstructions)
+		if err := rows.Scan(&id, &name, &brand, &mainImage, &web, &stitched, &uom, &created, &cid, &cname, &active, &description, &fabricComposition, &pattern, &occasion, &careInstructions); err != nil {
+			return c.Status(500).SendString(err.Error())
+		}
 
 		out = append(out, fiber.Map{
 			"id":                 id,

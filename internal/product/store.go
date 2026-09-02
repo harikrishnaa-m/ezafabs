@@ -69,19 +69,19 @@ func (s *Store) List(limit, offset int) (*sql.Rows, error) {
 		p.id,
 		p.name,
 		p.brand,
-		p.main_image_url,
+		COALESCE(p.main_image_url, ''),
 		p.is_web_visible,
 		p.is_stitched,
 		p.uom,
-		p.created_at,
+		COALESCE(p.created_at::text, ''),
 		c.id,
 		c.name,
 		p.is_active,
-		p.description,
-		p.fabric_composition,
-		p.pattern,
-		p.occasion,
-		p.care_instructions
+		COALESCE(p.description, ''),
+		COALESCE(p.fabric_composition, ''),
+		COALESCE(p.pattern, ''),
+		COALESCE(p.occasion, ''),
+		COALESCE(p.care_instructions, '')
 	FROM products p
 	JOIN categories c ON c.id = p.category_id
 	ORDER BY p.created_at DESC

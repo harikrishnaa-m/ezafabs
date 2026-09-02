@@ -16,13 +16,14 @@ func NewStore(db *sql.DB) *Store {
 }
 
 // ListProducts returns paginated products visible on web.
-func (s *Store) ListProducts(categoryID string, search string, page, limit int) ([]map[string]interface{}, int, error) {
+func (s *Store) ListProducts(categoryID string, search string, attributeValueIDs []string, page, limit int) ([]map[string]interface{}, int, error) {
 	offset := (page - 1) * limit
 
 	// Build dynamic WHERE
 	where := "WHERE p.is_active = true AND p.is_web_visible = true"
 	args := []interface{}{}
 	idx := 1
+	attributeValueStartIndex := 0
 
 	if categoryID != "" {
 		where += " AND p.category_id = $" + strconv.Itoa(idx)
@@ -33,6 +34,25 @@ func (s *Store) ListProducts(categoryID string, search string, page, limit int) 
 		where += " AND (p.name ILIKE $" + strconv.Itoa(idx) + " OR p.brand ILIKE $" + strconv.Itoa(idx) + ")"
 		args = append(args, "%"+search+"%")
 		idx++
+	}
+	if len(attributeValueIDs) > 0 {
+		attributeValueStartIndex = idx
+		placeholders := make([]string, len(attributeValueIDs))
+		for i, attributeValueID := range attributeValueIDs {
+			placeholders[i] = "$" + strconv.Itoa(idx+i)
+			args = append(args, attributeValueID)
+		}
+		where += ` AND EXISTS (
+			SELECT 1
+			FROM variants fv
+			JOIN variant_attribute_mapping fvam ON fvam.variant_id = fv.id
+			JOIN attribute_values fav ON fav.id = fvam.attribute_value_id
+			WHERE fv.product_id = p.id
+			  AND fv.is_active = true
+			  AND fav.is_active = true
+			  AND fvam.attribute_value_id IN (` + strings.Join(placeholders, ", ") + `)
+		)`
+		idx += len(attributeValueIDs)
 	}
 
 	// Count
@@ -49,8 +69,8 @@ func (s *Store) ListProducts(categoryID string, search string, page, limit int) 
 		SELECT p.id, p.name, COALESCE(p.description, ''), COALESCE(p.brand, ''),
 		       COALESCE(p.main_image_url, ''), COALESCE(c.name, '') AS category,
 		       p.uom,
-		       (SELECT MIN(v.price) FROM variants v WHERE v.product_id = p.id AND v.is_active = true) AS min_price,
-		       (SELECT MAX(v.price) FROM variants v WHERE v.product_id = p.id AND v.is_active = true) AS max_price
+			(SELECT MIN(v.price) FROM variants v WHERE v.product_id = p.id AND v.is_active = true` + variantAttributeCondition("v", attributeValueIDs, attributeValueStartIndex) + `) AS min_price,
+			(SELECT MAX(v.price) FROM variants v WHERE v.product_id = p.id AND v.is_active = true` + variantAttributeCondition("v", attributeValueIDs, attributeValueStartIndex) + `) AS max_price
 		FROM products p
 		LEFT JOIN categories c ON c.id = p.category_id
 		` + where + `
@@ -109,6 +129,11 @@ func (s *Store) ListProducts(categoryID string, search string, page, limit int) 
 			phProd[i] = "$" + strconv.Itoa(i+1)
 			prodArgs[i] = pid
 		}
+		if len(attributeValueIDs) > 0 {
+			for _, attributeValueID := range attributeValueIDs {
+				prodArgs = append(prodArgs, attributeValueID)
+			}
+		}
 		prodIn := strings.Join(phProd, ", ")
 
 		varRows, err := s.db.Query(`
@@ -116,7 +141,7 @@ func (s *Store) ListProducts(categoryID string, search string, page, limit int) 
 			       COALESCE(os.quantity, 0) AS online_stock
 			FROM variants v
 			LEFT JOIN online_stocks os ON os.variant_id = v.id
-			WHERE v.product_id IN (`+prodIn+`) AND v.is_active = true
+			WHERE v.product_id IN (`+prodIn+`) AND v.is_active = true`+variantAttributeCondition("v", attributeValueIDs, len(pIDs)+1)+`
 			ORDER BY v.variant_code
 		`, prodArgs...)
 		if err == nil {
@@ -210,6 +235,25 @@ func (s *Store) ListProducts(categoryID string, search string, page, limit int) 
 	_ = totalPages
 
 	return products, total, nil
+}
+
+func variantAttributeCondition(alias string, attributeValueIDs []string, startIndex int) string {
+	if len(attributeValueIDs) == 0 {
+		return ""
+	}
+
+	placeholders := make([]string, len(attributeValueIDs))
+	for i := range attributeValueIDs {
+		placeholders[i] = "$" + strconv.Itoa(startIndex+i)
+	}
+	return ` AND EXISTS (
+		SELECT 1
+		FROM variant_attribute_mapping vam
+		JOIN attribute_values av ON av.id = vam.attribute_value_id
+		WHERE vam.variant_id = ` + alias + `.id
+		  AND av.is_active = true
+		  AND vam.attribute_value_id IN (` + strings.Join(placeholders, ", ") + `)
+	)`
 }
 
 // GetProductDetail returns a product with its variants, images, and stock info.
