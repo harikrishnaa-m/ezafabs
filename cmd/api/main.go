@@ -308,6 +308,7 @@ func main() {
 	// ═══════════════════════════════════════════
 	ecom := api.Group("/ecom")
 	ecomCustomer.RegisterPublicRoutes(ecom.Group("/auth"), ecomCustomerHandler)
+	ecom.Get("/attributes", ecomProductHandler.Attributes)
 	ecomProduct.RegisterRoutes(ecom.Group("/products"), ecomProductHandler)
 
 	// Public webhooks — must be registered BEFORE ecomProtected is created

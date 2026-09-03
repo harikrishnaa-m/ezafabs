@@ -2,6 +2,7 @@ package product
 
 import (
 	"math"
+	"strconv"
 	"strings"
 
 	"github.com/gofiber/fiber/v2"
@@ -22,12 +23,20 @@ func (h *Handler) List(c *fiber.Ctx) error {
 	limit := c.QueryInt("limit", 20)
 	categoryID := c.Query("category_id")
 	search := c.Query("q")
+	minPrice, maxPrice, err := parsePriceRange(c)
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
+	}
+	sort, err := parsePriceSort(c.Query("sort"))
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
+	}
 	attributeValueIDs, err := parseAttributeValueIDs(c)
 	if err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "attribute_value_ids must contain valid UUIDs"})
 	}
 
-	products, total, err := h.store.ListProducts(categoryID, search, attributeValueIDs, page, limit)
+	products, total, err := h.store.ListProducts(categoryID, search, attributeValueIDs, minPrice, maxPrice, sort, page, limit)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": "failed to fetch products"})
 	}
@@ -42,6 +51,41 @@ func (h *Handler) List(c *fiber.Ctx) error {
 		"total_pages": int(math.Ceil(float64(total) / float64(limit))),
 		"data":        products,
 	})
+}
+
+func parsePriceRange(c *fiber.Ctx) (*float64, *float64, error) {
+	var minPrice, maxPrice *float64
+	for name, target := range map[string]**float64{
+		"min_price": &minPrice,
+		"max_price": &maxPrice,
+	} {
+		rawValue := c.Query(name)
+		if rawValue == "" {
+			continue
+		}
+		value, err := strconv.ParseFloat(rawValue, 64)
+		if err != nil || value < 0 {
+			return nil, nil, fiber.NewError(400, name+" must be a non-negative number")
+		}
+		*target = &value
+	}
+	if minPrice != nil && maxPrice != nil && *minPrice > *maxPrice {
+		return nil, nil, fiber.NewError(400, "min_price must be less than or equal to max_price")
+	}
+	return minPrice, maxPrice, nil
+}
+
+func parsePriceSort(value string) (string, error) {
+	switch value {
+	case "":
+		return "", nil
+	case "price_asc", "low_to_high":
+		return "price_asc", nil
+	case "price_desc", "high_to_low":
+		return "price_desc", nil
+	default:
+		return "", fiber.NewError(400, "sort must be price_asc or price_desc")
+	}
 }
 
 func parseAttributeValueIDs(c *fiber.Ctx) ([]string, error) {
@@ -86,4 +130,16 @@ func (h *Handler) Categories(c *fiber.Ctx) error {
 		cats = []map[string]interface{}{}
 	}
 	return c.JSON(fiber.Map{"categories": cats})
+}
+
+// GET /ecom/attributes
+func (h *Handler) Attributes(c *fiber.Ctx) error {
+	attributes, err := h.store.ListAttributes()
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "failed to fetch attributes"})
+	}
+	if attributes == nil {
+		attributes = []map[string]interface{}{}
+	}
+	return c.JSON(fiber.Map{"attributes": attributes})
 }

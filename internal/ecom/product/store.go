@@ -16,7 +16,7 @@ func NewStore(db *sql.DB) *Store {
 }
 
 // ListProducts returns paginated products visible on web.
-func (s *Store) ListProducts(categoryID string, search string, attributeValueIDs []string, page, limit int) ([]map[string]interface{}, int, error) {
+func (s *Store) ListProducts(categoryID string, search string, attributeValueIDs []string, minPrice, maxPrice *float64, sort string, page, limit int) ([]map[string]interface{}, int, error) {
 	offset := (page - 1) * limit
 
 	// Build dynamic WHERE
@@ -54,6 +54,24 @@ func (s *Store) ListProducts(categoryID string, search string, attributeValueIDs
 		)`
 		idx += len(attributeValueIDs)
 	}
+	if minPrice != nil || maxPrice != nil {
+		where += ` AND EXISTS (
+			SELECT 1
+			FROM variants pv
+			WHERE pv.product_id = p.id
+			  AND pv.is_active = true`
+		if minPrice != nil {
+			where += " AND pv.price >= $" + strconv.Itoa(idx)
+			args = append(args, *minPrice)
+			idx++
+		}
+		if maxPrice != nil {
+			where += " AND pv.price <= $" + strconv.Itoa(idx)
+			args = append(args, *maxPrice)
+			idx++
+		}
+		where += "\n\t\t)"
+	}
 
 	// Count
 	var total int
@@ -65,6 +83,13 @@ func (s *Store) ListProducts(categoryID string, search string, attributeValueIDs
 	}
 
 	// Fetch products
+	orderBy := "p.created_at DESC"
+	if sort == "price_asc" {
+		orderBy = "min_price ASC NULLS LAST, p.created_at DESC"
+	} else if sort == "price_desc" {
+		orderBy = "min_price DESC NULLS LAST, p.created_at DESC"
+	}
+
 	query := `
 		SELECT p.id, p.name, COALESCE(p.description, ''), COALESCE(p.brand, ''),
 		       COALESCE(p.main_image_url, ''), COALESCE(c.name, '') AS category,
@@ -74,7 +99,7 @@ func (s *Store) ListProducts(categoryID string, search string, attributeValueIDs
 		FROM products p
 		LEFT JOIN categories c ON c.id = p.category_id
 		` + where + `
-		ORDER BY p.created_at DESC
+		ORDER BY ` + orderBy + `
 		LIMIT $` + strconv.Itoa(idx) + ` OFFSET $` + strconv.Itoa(idx+1)
 
 	args = append(args, limit, offset)
@@ -404,6 +429,56 @@ func (s *Store) ListCategories() ([]map[string]interface{}, error) {
 		})
 	}
 	return cats, nil
+}
+
+// ListAttributes returns active attributes and their active values for web filters.
+func (s *Store) ListAttributes() ([]map[string]interface{}, error) {
+	rows, err := s.db.Query(`
+		SELECT a.id, a.name, av.id, av.value
+		FROM attributes a
+		LEFT JOIN attribute_values av
+			ON av.attribute_id = a.id AND av.is_active = true
+		WHERE a.is_active = true
+		ORDER BY a.name, av.value
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	attributes := []map[string]interface{}{}
+	attributeByID := map[string]map[string]interface{}{}
+	for rows.Next() {
+		var attributeID, attributeName string
+		var valueID, value sql.NullString
+		if err := rows.Scan(&attributeID, &attributeName, &valueID, &value); err != nil {
+			return nil, err
+		}
+
+		attribute, ok := attributeByID[attributeID]
+		if !ok {
+			attribute = map[string]interface{}{
+				"id":     attributeID,
+				"name":   attributeName,
+				"values": []map[string]string{},
+			}
+			attributeByID[attributeID] = attribute
+			attributes = append(attributes, attribute)
+		}
+
+		if valueID.Valid {
+			values := attribute["values"].([]map[string]string)
+			attribute["values"] = append(values, map[string]string{
+				"id":    valueID.String,
+				"value": value.String,
+			})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return attributes, nil
 }
 
 func nullStr(ns sql.NullString) string {
