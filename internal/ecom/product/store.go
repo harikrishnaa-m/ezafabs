@@ -222,7 +222,7 @@ func (s *Store) ListProducts(categoryID string, search string, attributeValueIDs
 
 				// Variant attributes
 				attrRows, err := s.db.Query(`
-					SELECT vam.variant_id, a.name, av.value
+					SELECT vam.variant_id, a.name, av.value, COALESCE(av.hex_code, '')
 					FROM variant_attribute_mapping vam
 					JOIN attribute_values av ON av.id = vam.attribute_value_id
 					JOIN attributes a ON a.id = av.attribute_id
@@ -230,8 +230,8 @@ func (s *Store) ListProducts(categoryID string, search string, attributeValueIDs
 				`, varArgs2...)
 				if err == nil {
 					for attrRows.Next() {
-						var variantID, aName, aVal string
-						attrRows.Scan(&variantID, &aName, &aVal)
+						var variantID, aName, aVal, hexCode string
+						attrRows.Scan(&variantID, &aName, &aVal, &hexCode)
 						if v, ok := variantMap[variantID]; ok {
 							attrs, _ := v["attributes"].(map[string]string)
 							if attrs == nil {
@@ -239,6 +239,12 @@ func (s *Store) ListProducts(categoryID string, search string, attributeValueIDs
 							}
 							attrs[aName] = aVal
 							v["attributes"] = attrs
+							details, _ := v["attribute_details"].(map[string]map[string]string)
+							if details == nil {
+								details = map[string]map[string]string{}
+							}
+							details[aName] = map[string]string{"value": aVal, "hex_code": hexCode}
+							v["attribute_details"] = details
 						}
 					}
 					attrRows.Close()
@@ -380,7 +386,7 @@ func (s *Store) GetProductDetail(productID string) (map[string]interface{}, erro
 
 		// Variant attributes
 		attrRows, err := s.db.Query(`
-			SELECT a.name, av.value
+			SELECT a.name, av.value, COALESCE(av.hex_code, '')
 			FROM variant_attribute_mapping vam
 			JOIN attribute_values av ON av.id = vam.attribute_value_id
 			JOIN attributes a ON a.id = av.attribute_id
@@ -388,14 +394,17 @@ func (s *Store) GetProductDetail(productID string) (map[string]interface{}, erro
 		`, vid)
 		if err == nil {
 			attrs := map[string]string{}
+			attributeDetails := map[string]map[string]string{}
 			for attrRows.Next() {
-				var aName, aVal string
-				attrRows.Scan(&aName, &aVal)
+				var aName, aVal, hexCode string
+				attrRows.Scan(&aName, &aVal, &hexCode)
 				attrs[aName] = aVal
+				attributeDetails[aName] = map[string]string{"value": aVal, "hex_code": hexCode}
 			}
 			attrRows.Close()
 			if len(attrs) > 0 {
 				v["attributes"] = attrs
+				v["attribute_details"] = attributeDetails
 			}
 		}
 
@@ -434,7 +443,7 @@ func (s *Store) ListCategories() ([]map[string]interface{}, error) {
 // ListAttributes returns active attributes and their active values for web filters.
 func (s *Store) ListAttributes() ([]map[string]interface{}, error) {
 	rows, err := s.db.Query(`
-		SELECT a.id, a.name, av.id, av.value
+		SELECT a.id, a.name, av.id, av.value, COALESCE(av.hex_code, '')
 		FROM attributes a
 		LEFT JOIN attribute_values av
 			ON av.attribute_id = a.id AND av.is_active = true
@@ -450,8 +459,8 @@ func (s *Store) ListAttributes() ([]map[string]interface{}, error) {
 	attributeByID := map[string]map[string]interface{}{}
 	for rows.Next() {
 		var attributeID, attributeName string
-		var valueID, value sql.NullString
-		if err := rows.Scan(&attributeID, &attributeName, &valueID, &value); err != nil {
+		var valueID, value, hexCode sql.NullString
+		if err := rows.Scan(&attributeID, &attributeName, &valueID, &value, &hexCode); err != nil {
 			return nil, err
 		}
 
@@ -469,8 +478,9 @@ func (s *Store) ListAttributes() ([]map[string]interface{}, error) {
 		if valueID.Valid {
 			values := attribute["values"].([]map[string]string)
 			attribute["values"] = append(values, map[string]string{
-				"id":    valueID.String,
-				"value": value.String,
+				"id":       valueID.String,
+				"value":    value.String,
+				"hex_code": hexCode.String,
 			})
 		}
 	}

@@ -17,6 +17,7 @@ func RegisterProtectedRoutes(r fiber.Router, h *Handler) {
 	r.Get("/profile", h.GetProfile)
 	r.Patch("/profile", h.UpdateProfile)
 	r.Post("/change-password", h.ChangePassword)
+	r.Delete("/account", h.DeleteAccount)
 
 	// Addresses
 	r.Post("/addresses", h.AddAddress)

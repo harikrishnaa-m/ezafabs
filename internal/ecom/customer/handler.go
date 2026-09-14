@@ -341,6 +341,17 @@ func (h *Handler) ChangePassword(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"message": "password changed successfully"})
 }
 
+// DELETE /ecom/account
+func (h *Handler) DeleteAccount(c *fiber.Ctx) error {
+	cust := c.Locals("ecom_customer").(*ecomMw.EcomCustomer)
+
+	if err := h.store.DeleteAccount(cust.ID); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "failed to delete account"})
+	}
+
+	return c.JSON(fiber.Map{"message": "account deleted successfully"})
+}
+
 // PATCH /ecom/profile
 func (h *Handler) UpdateProfile(c *fiber.Ctx) error {
 	cust := c.Locals("ecom_customer").(*ecomMw.EcomCustomer)
@@ -350,11 +361,40 @@ func (h *Handler) UpdateProfile(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid JSON"})
 	}
 
+	if in.Email != nil {
+		in.Email = stringPtr(strings.TrimSpace(strings.ToLower(*in.Email)))
+		if *in.Email == "" {
+			return c.Status(400).JSON(fiber.Map{"error": "email cannot be empty"})
+		}
+		if h.store.EmailExistsForOther(*in.Email, cust.ID) {
+			return c.Status(409).JSON(fiber.Map{"error": "email already registered"})
+		}
+	}
+
+	if in.DateOfBirth != nil && *in.DateOfBirth != "" {
+		if _, err := time.Parse("2006-01-02", *in.DateOfBirth); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "date_of_birth must use YYYY-MM-DD format"})
+		}
+	}
+
+	if in.Name == nil && in.FirstName == nil && in.LastName == nil && in.Email == nil && in.Phone == nil && in.DateOfBirth == nil {
+		return c.Status(400).JSON(fiber.Map{"error": "at least one profile field is required"})
+	}
+
 	if err := h.store.UpdateProfile(cust.ID, in); err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": "update failed"})
 	}
 
-	return c.JSON(fiber.Map{"message": "profile updated"})
+	profile, err := h.store.GetProfile(cust.ID)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "profile updated but failed to fetch profile"})
+	}
+
+	return c.JSON(fiber.Map{"message": "profile updated", "profile": profile})
+}
+
+func stringPtr(value string) *string {
+	return &value
 }
 
 // ── Addresses ───────────────────────────────────────────────

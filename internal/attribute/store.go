@@ -52,17 +52,17 @@ func (s *Store) SetActive(id string, active bool) error {
 // ATTRIBUTE VALUES
 //
 
-func (s *Store) CreateValue(attID, value string) error {
+func (s *Store) CreateValue(attID, value, hexCode string) error {
 	_, err := s.db.Exec(`
-	INSERT INTO attribute_values (attribute_id,value)
-	VALUES ($1,$2)
-	`, attID, value)
+	INSERT INTO attribute_values (attribute_id, value, hex_code)
+	VALUES ($1, $2, NULLIF($3, ''))
+	`, attID, value, hexCode)
 	return err
 }
 
 func (s *Store) ListValues(attID string) (*sql.Rows, error) {
 	return s.db.Query(`
-	SELECT id, value, is_active
+	SELECT id, value, COALESCE(hex_code, ''), is_active
 	FROM attribute_values
 	WHERE attribute_id=$1
 	ORDER BY value
@@ -77,12 +77,13 @@ func (s *Store) SetValueActive(id string, active bool) error {
 	return err
 }
 
-func (s *Store) UpdateValue(id string, value *string) error {
+func (s *Store) UpdateValue(id string, value, hexCode *string) error {
 	_, err := s.db.Exec(`
 	UPDATE attribute_values
-	SET value = COALESCE($1,value)
-	WHERE id=$2
-	`, value, id)
+	SET value = COALESCE($1, value),
+	    hex_code = CASE WHEN $3 IS NULL THEN hex_code ELSE NULLIF($3, '') END
+	WHERE id = $2
+	`, value, id, hexCode)
 
 	return err
 }

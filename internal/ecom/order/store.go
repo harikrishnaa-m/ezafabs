@@ -3,10 +3,11 @@ package order
 import (
 	"database/sql"
 	"fmt"
-	"math"
 	"strconv"
 	"strings"
 	"time"
+
+	"defab-erp/internal/ecom/pricing"
 )
 
 type Store struct {
@@ -74,9 +75,10 @@ func (s *Store) Checkout(customerID string, in CheckoutInput) (map[string]interf
 		itemCount += it.Quantity
 	}
 
-	shippingCharge := in.ShippingCharge
-	grandTotal := subTotal - 0 + 0 + shippingCharge // discount=0, tax=0 for now
-	grandTotal = math.Round(grandTotal*100) / 100
+	if in.ShippingCharge < 0 {
+		return nil, fmt.Errorf("shipping charge cannot be negative")
+	}
+	totals := pricing.Calculate(subTotal, in.ShippingCharge)
 
 	// 3. Snapshot the shipping address
 	var shippingName, shippingPhone, shippingAddr, shippingCity, shippingState, shippingPincode string
@@ -113,8 +115,8 @@ func (s *Store) Checkout(customerID string, in CheckoutInput) (map[string]interf
 	`, orderNumber, customerID, nilIfEmpty(in.AddressID),
 		shippingName, shippingPhone, shippingAddr,
 		shippingCity, shippingState, shippingPincode,
-		itemCount, subTotal, 0, 0,
-		shippingCharge, grandTotal,
+		itemCount, totals.SubTotal, totals.DiscountAmount, totals.TaxAmount,
+		totals.ShippingCharge, totals.GrandTotal,
 		in.PaymentMethod, in.Notes,
 	).Scan(&orderID)
 	if err != nil {
@@ -160,12 +162,15 @@ func (s *Store) Checkout(customerID string, in CheckoutInput) (map[string]interf
 	}
 
 	return map[string]interface{}{
-		"order_id":     orderID,
-		"order_number": orderNumber,
-		"item_count":   itemCount,
-		"sub_total":    subTotal,
-		"grand_total":  grandTotal,
-		"status":       "PENDING",
+		"order_id":        orderID,
+		"order_number":    orderNumber,
+		"item_count":      itemCount,
+		"sub_total":       totals.SubTotal,
+		"discount_amount": totals.DiscountAmount,
+		"tax_amount":      totals.TaxAmount,
+		"shipping_charge": totals.ShippingCharge,
+		"grand_total":     totals.GrandTotal,
+		"status":          "PENDING",
 	}, nil
 }
 

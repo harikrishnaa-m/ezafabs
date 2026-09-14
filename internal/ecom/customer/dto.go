@@ -19,8 +19,12 @@ type GoogleSignInInput struct {
 }
 
 type UpdateProfileInput struct {
-	Name  string `json:"name"`
-	Phone string `json:"phone"`
+	Name        *string `json:"name"`
+	FirstName   *string `json:"first_name"`
+	LastName    *string `json:"last_name"`
+	Email       *string `json:"email"`
+	Phone       *string `json:"phone"`
+	DateOfBirth *string `json:"date_of_birth"`
 }
 
 type ForgotPasswordInput struct {

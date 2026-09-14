@@ -22,6 +22,12 @@ func (s *Store) EmailExists(email string) bool {
 	return exists
 }
 
+func (s *Store) EmailExistsForOther(email, customerID string) bool {
+	var exists bool
+	s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM ecom_customers WHERE email = $1 AND id <> $2)`, email, customerID).Scan(&exists)
+	return exists
+}
+
 func (s *Store) Create(name, email, phone, passwordHash string) (string, error) {
 	var id string
 	err := s.db.QueryRow(`
@@ -116,14 +122,37 @@ func (s *Store) GetPasswordHash(customerID string) (string, error) {
 	return hash.String, nil
 }
 
+func (s *Store) DeleteAccount(customerID string) error {
+	_, err := s.db.Exec(`
+		UPDATE ecom_customers
+		SET name = 'Deleted Customer',
+		    first_name = NULL,
+		    last_name = NULL,
+		    email = 'deleted+' || id::text || '@deleted.local',
+		    phone = NULL,
+		    date_of_birth = NULL,
+		    password_hash = NULL,
+		    google_id = NULL,
+		    reset_token = NULL,
+		    reset_token_expiry = NULL,
+		    is_active = false,
+		    updated_at = NOW()
+		WHERE id = $1 AND is_active = true
+	`, customerID)
+	return err
+}
+
 func (s *Store) GetProfile(customerID string) (map[string]interface{}, error) {
 	var name, email string
+	var firstName, lastName, dateOfBirth string
 	var phone sql.NullString
 	var createdAt time.Time
 
 	err := s.db.QueryRow(`
-		SELECT name, email, phone, created_at FROM ecom_customers WHERE id = $1
-	`, customerID).Scan(&name, &email, &phone, &createdAt)
+		SELECT name, COALESCE(first_name, ''), COALESCE(last_name, ''), email, phone,
+		       COALESCE(TO_CHAR(date_of_birth, 'YYYY-MM-DD'), ''), created_at
+		FROM ecom_customers WHERE id = $1
+	`, customerID).Scan(&name, &firstName, &lastName, &email, &phone, &dateOfBirth, &createdAt)
 	if err != nil {
 		return nil, err
 	}
@@ -134,19 +163,61 @@ func (s *Store) GetProfile(customerID string) (map[string]interface{}, error) {
 	}
 
 	return map[string]interface{}{
-		"id":         customerID,
-		"name":       name,
-		"email":      email,
-		"phone":      p,
-		"created_at": createdAt,
+		"id":            customerID,
+		"name":          name,
+		"first_name":    firstName,
+		"last_name":     lastName,
+		"email":         email,
+		"phone":         p,
+		"date_of_birth": dateOfBirth,
+		"created_at":    createdAt,
 	}, nil
 }
 
 func (s *Store) UpdateProfile(customerID string, in UpdateProfileInput) error {
+	var currentName, currentFirstName, currentLastName, currentEmail, currentPhone, currentDateOfBirth string
+	if err := s.db.QueryRow(`
+		SELECT name, COALESCE(first_name, ''), COALESCE(last_name, ''), email,
+		       COALESCE(phone, ''), COALESCE(TO_CHAR(date_of_birth, 'YYYY-MM-DD'), '')
+		FROM ecom_customers WHERE id = $1
+	`, customerID).Scan(&currentName, &currentFirstName, &currentLastName, &currentEmail, &currentPhone, &currentDateOfBirth); err != nil {
+		return err
+	}
+
+	if in.Name != nil {
+		currentName = *in.Name
+	}
+	if in.FirstName != nil {
+		currentFirstName = *in.FirstName
+	}
+	if in.LastName != nil {
+		currentLastName = *in.LastName
+	}
+	if in.FirstName != nil || in.LastName != nil {
+		currentName = currentFirstName
+		if currentLastName != "" {
+			if currentName != "" {
+				currentName += " "
+			}
+			currentName += currentLastName
+		}
+	}
+	if in.Email != nil {
+		currentEmail = *in.Email
+	}
+	if in.Phone != nil {
+		currentPhone = *in.Phone
+	}
+	if in.DateOfBirth != nil {
+		currentDateOfBirth = *in.DateOfBirth
+	}
+
 	_, err := s.db.Exec(`
-		UPDATE ecom_customers SET name = $2, phone = $3, updated_at = NOW()
+		UPDATE ecom_customers
+		SET name = $2, first_name = $3, last_name = $4, email = $5, phone = $6,
+		    date_of_birth = NULLIF($7, '')::date, updated_at = NOW()
 		WHERE id = $1
-	`, customerID, in.Name, in.Phone)
+	`, customerID, currentName, currentFirstName, currentLastName, currentEmail, currentPhone, currentDateOfBirth)
 	return err
 }
 

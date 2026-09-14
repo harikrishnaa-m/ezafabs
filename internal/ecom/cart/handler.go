@@ -1,9 +1,12 @@
 package cart
 
 import (
+	"fmt"
+	"strconv"
 	"strings"
 
 	ecomMw "defab-erp/internal/ecom/middleware"
+	"defab-erp/internal/ecom/pricing"
 
 	"github.com/gofiber/fiber/v2"
 )
@@ -28,13 +31,39 @@ func (h *Handler) Get(c *fiber.Ctx) error {
 		items = []map[string]interface{}{}
 	}
 
-	count, total, _ := h.store.CartSummary(cust.ID)
+	count, subtotal, err := h.store.CartSummary(cust.ID)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "failed to calculate cart totals"})
+	}
+
+	shippingCharge, err := parseShippingCharge(c.Query("shipping_charge"))
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
+	}
+	totals := pricing.Calculate(subtotal, shippingCharge)
 
 	return c.JSON(fiber.Map{
-		"items":      items,
-		"item_count": count,
-		"total":      total,
+		"items":           items,
+		"item_count":      count,
+		"total":           totals.SubTotal,
+		"sub_total":       totals.SubTotal,
+		"discount_amount": totals.DiscountAmount,
+		"tax_amount":      totals.TaxAmount,
+		"shipping_charge": totals.ShippingCharge,
+		"grand_total":     totals.GrandTotal,
 	})
+}
+
+func parseShippingCharge(value string) (float64, error) {
+	if value == "" {
+		return 0, nil
+	}
+
+	shippingCharge, err := strconv.ParseFloat(value, 64)
+	if err != nil || shippingCharge < 0 {
+		return 0, fmt.Errorf("shipping_charge must be a non-negative number")
+	}
+	return shippingCharge, nil
 }
 
 // POST /ecom/cart/items

@@ -11,8 +11,10 @@ type UpdateAttributeInput struct {
 type CreateValueInput struct {
 	AttributeID string `json:"attribute_id"`
 	Value       string `json:"value"`
+	HexCode     string `json:"hex_code"`
 }
 
 type UpdateValueInput struct {
-	Value *string `json:"value"`
+	Value   *string `json:"value"`
+	HexCode *string `json:"hex_code"`
 }
