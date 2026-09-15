@@ -435,6 +435,16 @@ func (h *Handler) ListAddresses(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"addresses": addrs})
 }
 
+// GET /ecom/addresses/:id
+func (h *Handler) GetAddress(c *fiber.Ctx) error {
+	cust := c.Locals("ecom_customer").(*ecomMw.EcomCustomer)
+	addr, err := h.store.GetAddress(cust.ID, c.Params("id"))
+	if err != nil {
+		return c.Status(404).JSON(fiber.Map{"error": "address not found"})
+	}
+	return c.JSON(addr)
+}
+
 // PUT /ecom/addresses/:id
 func (h *Handler) UpdateAddress(c *fiber.Ctx) error {
 	cust := c.Locals("ecom_customer").(*ecomMw.EcomCustomer)
@@ -443,6 +453,9 @@ func (h *Handler) UpdateAddress(c *fiber.Ctx) error {
 	var in AddressInput
 	if err := c.BodyParser(&in); err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid JSON"})
+	}
+	if in.FullName == "" || in.Phone == "" || in.AddressLine1 == "" || in.City == "" || in.State == "" || in.Pincode == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "full_name, phone, address_line1, city, state, pincode are required"})
 	}
 
 	if err := h.store.UpdateAddress(cust.ID, addrID, in); err != nil {

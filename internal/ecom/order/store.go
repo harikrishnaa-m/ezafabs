@@ -75,10 +75,7 @@ func (s *Store) Checkout(customerID string, in CheckoutInput) (map[string]interf
 		itemCount += it.Quantity
 	}
 
-	if in.ShippingCharge < 0 {
-		return nil, fmt.Errorf("shipping charge cannot be negative")
-	}
-	totals := pricing.Calculate(subTotal, in.ShippingCharge)
+	totals := pricing.Calculate(subTotal, 0)
 
 	// 3. Snapshot the shipping address
 	var shippingName, shippingPhone, shippingAddr, shippingCity, shippingState, shippingPincode string
@@ -221,6 +218,11 @@ func (s *Store) ListOrders(customerID string, page, limit int) ([]map[string]int
 			"payment_method": pm,
 			"created_at":     createdAt,
 		}
+		items, err := s.fetchOrderItems(id)
+		if err != nil {
+			return nil, 0, err
+		}
+		row["items"] = items
 		if deliveredAt.Valid {
 			validTill := deliveredAt.Time.Add(7 * 24 * time.Hour)
 			row["return_valid_till"] = validTill
@@ -288,12 +290,13 @@ func (s *Store) GetOrder(customerID, orderID string) (map[string]interface{}, er
 		"payment_ref":     nullStr(payRef),
 		"notes":           nullStr(notes),
 		"shipping_address": map[string]interface{}{
-			"name":    nullStr(shippingName),
-			"phone":   nullStr(shippingPhone),
-			"address": nullStr(shippingAddr),
-			"city":    nullStr(shippingCity),
-			"state":   nullStr(shippingState),
-			"pincode": nullStr(shippingPincode),
+			"full_name": nullStr(shippingName),
+			"name":      nullStr(shippingName),
+			"phone":     nullStr(shippingPhone),
+			"address":   nullStr(shippingAddr),
+			"city":      nullStr(shippingCity),
+			"state":     nullStr(shippingState),
+			"pincode":   nullStr(shippingPincode),
 		},
 		"created_at":        createdAt,
 		"updated_at":        updatedAt,
@@ -301,7 +304,16 @@ func (s *Store) GetOrder(customerID, orderID string) (map[string]interface{}, er
 		"return_eligible":   returnEligible,
 	}
 
-	// Fetch items
+	items, err := s.fetchOrderItems(orderID)
+	if err != nil {
+		return order, nil
+	}
+	order["items"] = items
+
+	return order, nil
+}
+
+func (s *Store) fetchOrderItems(orderID string) ([]map[string]interface{}, error) {
 	itemRows, err := s.db.Query(`
 		SELECT id, variant_id, product_name, variant_name, sku, variant_code,
 		       quantity, unit_price, total_price
@@ -310,83 +322,91 @@ func (s *Store) GetOrder(customerID, orderID string) (map[string]interface{}, er
 		ORDER BY created_at
 	`, orderID)
 	if err != nil {
-		return order, nil
+		return nil, err
 	}
 	defer itemRows.Close()
 
 	var items []map[string]interface{}
-	variantIDs := []string{}
+	var variantIDs []string
 	for itemRows.Next() {
 		var iid, vid, pName, vName, sku string
 		var vCode, qty int
 		var uPrice, tPrice float64
-		itemRows.Scan(&iid, &vid, &pName, &vName, &sku, &vCode, &qty, &uPrice, &tPrice)
+		if err := itemRows.Scan(&iid, &vid, &pName, &vName, &sku, &vCode, &qty, &uPrice, &tPrice); err != nil {
+			return nil, err
+		}
 
 		items = append(items, map[string]interface{}{
-			"id":           iid,
-			"variant_id":   vid,
-			"product_name": pName,
-			"variant_name": vName,
-			"sku":          sku,
-			"variant_code": vCode,
-			"quantity":     qty,
-			"unit_price":   uPrice,
-			"total_price":  tPrice,
+			"id":             iid,
+			"variant_id":     vid,
+			"product_name":   pName,
+			"variant_name":   vName,
+			"sku":            sku,
+			"variant_code":   vCode,
+			"quantity":       qty,
+			"unit_price":     uPrice,
+			"total_price":    tPrice,
+			"variant_images": []string{},
+			"product_image":  "",
 		})
 		variantIDs = append(variantIDs, vid)
 	}
 
-	// Fetch images for each variant and its product
-	if len(variantIDs) > 0 {
-		ph := make([]string, len(variantIDs))
-		args := make([]interface{}, len(variantIDs))
-		for i, vid := range variantIDs {
-			ph[i] = "$" + strconv.Itoa(i+1)
-			args[i] = vid
-		}
-		inClause := strings.Join(ph, ", ")
-
-		// Variant images
-		varImgMap := map[string][]string{}
-		vimgRows, err := s.db.Query(`SELECT variant_id, image_url FROM variant_images WHERE variant_id IN (`+inClause+`)`, args...)
-		if err == nil {
-			for vimgRows.Next() {
-				var vid, url string
-				vimgRows.Scan(&vid, &url)
-				varImgMap[vid] = append(varImgMap[vid], url)
-			}
-			vimgRows.Close()
-		}
-
-		// Product main image via variant → product
-		prodImgMap := map[string]string{}
-		prodImgRows, err := s.db.Query(`
-			SELECT v.id, COALESCE(p.main_image_url, '')
-			FROM variants v JOIN products p ON p.id = v.product_id
-			WHERE v.id IN (`+inClause+`)`, args...)
-		if err == nil {
-			for prodImgRows.Next() {
-				var vid, img string
-				prodImgRows.Scan(&vid, &img)
-				prodImgMap[vid] = img
-			}
-			prodImgRows.Close()
-		}
-
-		for _, item := range items {
-			vid := item["variant_id"].(string)
-			imgs := varImgMap[vid]
-			if imgs == nil {
-				imgs = []string{}
-			}
-			item["variant_images"] = imgs
-			item["product_image"] = prodImgMap[vid]
-		}
+	if len(variantIDs) == 0 {
+		return []map[string]interface{}{}, nil
 	}
 
-	order["items"] = items
+	placeholders := make([]string, len(variantIDs))
+	args := make([]interface{}, len(variantIDs))
+	for i, variantID := range variantIDs {
+		placeholders[i] = "$" + strconv.Itoa(i+1)
+		args[i] = variantID
+	}
+	inClause := strings.Join(placeholders, ", ")
 
-	return order, nil
+	variantImageMap := map[string][]string{}
+	imageRows, err := s.db.Query(`SELECT variant_id, image_url FROM variant_images WHERE variant_id IN (`+inClause+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	for imageRows.Next() {
+		var variantID, imageURL string
+		if err := imageRows.Scan(&variantID, &imageURL); err != nil {
+			imageRows.Close()
+			return nil, err
+		}
+		variantImageMap[variantID] = append(variantImageMap[variantID], imageURL)
+	}
+	imageRows.Close()
+
+	productImageMap := map[string]string{}
+	productRows, err := s.db.Query(`
+		SELECT v.id, COALESCE(p.main_image_url, '')
+		FROM variants v JOIN products p ON p.id = v.product_id
+		WHERE v.id IN (`+inClause+`)
+	`, args...)
+	if err != nil {
+		return nil, err
+	}
+	for productRows.Next() {
+		var variantID, imageURL string
+		if err := productRows.Scan(&variantID, &imageURL); err != nil {
+			productRows.Close()
+			return nil, err
+		}
+		productImageMap[variantID] = imageURL
+	}
+	productRows.Close()
+
+	for _, item := range items {
+		variantID := item["variant_id"].(string)
+		if images := variantImageMap[variantID]; images != nil {
+			item["variant_images"] = images
+		}
+		item["product_image"] = productImageMap[variantID]
+	}
+
+	return items, nil
 }
 
 // CancelOrderResult holds the details returned after a successful cancellation.
@@ -618,12 +638,13 @@ func (s *Store) AdminGetOrder(orderID string) (map[string]interface{}, error) {
 		"payment_ref":     nullStr(payRef),
 		"notes":           nullStr(notes),
 		"shipping_address": map[string]interface{}{
-			"name":    nullStr(shippingName),
-			"phone":   nullStr(shippingPhone),
-			"address": nullStr(shippingAddr),
-			"city":    nullStr(shippingCity),
-			"state":   nullStr(shippingState),
-			"pincode": nullStr(shippingPincode),
+			"full_name": nullStr(shippingName),
+			"name":      nullStr(shippingName),
+			"phone":     nullStr(shippingPhone),
+			"address":   nullStr(shippingAddr),
+			"city":      nullStr(shippingCity),
+			"state":     nullStr(shippingState),
+			"pincode":   nullStr(shippingPincode),
 		},
 		"created_at": createdAt,
 		"updated_at": updatedAt,

@@ -22,6 +22,8 @@ func RegisterProtectedRoutes(r fiber.Router, h *Handler) {
 	// Addresses
 	r.Post("/addresses", h.AddAddress)
 	r.Get("/addresses", h.ListAddresses)
+	r.Get("/addresses/:id", h.GetAddress)
 	r.Put("/addresses/:id", h.UpdateAddress)
+	r.Patch("/addresses/:id", h.UpdateAddress)
 	r.Delete("/addresses/:id", h.DeleteAddress)
 }
