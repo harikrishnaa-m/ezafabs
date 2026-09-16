@@ -68,7 +68,7 @@ func (s *Store) List(limit, offset int) (*sql.Rows, error) {
 	SELECT
 		p.id,
 		p.name,
-		p.brand,
+		COALESCE(p.brand, ''),
 		COALESCE(p.main_image_url, ''),
 		p.is_web_visible,
 		p.is_stitched,
