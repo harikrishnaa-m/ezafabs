@@ -86,19 +86,6 @@ func (s *Store) RequestReturn(customerID, orderID, reason string, payoutMethod, 
 		return nil, fmt.Errorf("a return request already exists for this order")
 	}
 
-	// COD orders require payout details
-	if info.PaymentMethod == "COD" {
-		if payoutMethod == nil {
-			return nil, fmt.Errorf("payout_method is required for COD orders (UPI or BANK)")
-		}
-		if *payoutMethod == "UPI" && (payoutUPI == nil || *payoutUPI == "") {
-			return nil, fmt.Errorf("payout_upi is required for UPI payout")
-		}
-		if *payoutMethod == "BANK" && (payoutAccountNumber == nil || payoutIFSC == nil || payoutAccountName == nil) {
-			return nil, fmt.Errorf("payout_account_number, payout_ifsc, and payout_account_name are required for BANK payout")
-		}
-	}
-
 	var ret ReturnRequest
 	err = s.db.QueryRow(`
 		INSERT INTO ecom_returns (
@@ -299,6 +286,76 @@ func (s *Store) MarkRefundInitiated(returnID, orderNumber string) error {
 	}
 	_, err = s.db.Exec(`UPDATE ecom_orders SET payment_status = 'REFUND_INITIATED', updated_at = NOW() WHERE order_number = $1`, orderNumber)
 	return err
+}
+
+func (s *Store) MarkRefundNotInitiated(returnID, orderNumber string) error {
+	_, err := s.db.Exec(`
+		UPDATE ecom_returns SET status = 'REFUND_NOT_INITIATED', updated_at = NOW()
+		WHERE id = $1 AND status = 'APPROVED'
+	`, returnID)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`
+		UPDATE ecom_orders SET payment_status = 'REFUND_NOT_INITIATED', updated_at = NOW()
+		WHERE order_number = $1 AND payment_status IN ('PAID', 'REFUND_NOT_INITIATED')
+	`, orderNumber)
+	return err
+}
+
+func (s *Store) AdminCompleteRefund(returnID string, amount float64, reference string, refundedAt time.Time, note string) error {
+	var orderID, returnStatus string
+	var grandTotal, refundedAmount float64
+	err := s.db.QueryRow(`
+		SELECT r.order_id, r.status, o.grand_total, r.refunded_amount
+		FROM ecom_returns r
+		JOIN ecom_orders o ON o.id = r.order_id
+		WHERE r.id = $1
+	`, returnID).Scan(&orderID, &returnStatus, &grandTotal, &refundedAmount)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("return request not found")
+	}
+	if err != nil {
+		return err
+	}
+	if returnStatus != "REFUND_NOT_INITIATED" && returnStatus != "REFUND_PARTIALLY_COMPLETED" {
+		return fmt.Errorf("return is not awaiting a manual refund")
+	}
+	if refundedAmount+amount > grandTotal {
+		return fmt.Errorf("refunded amount cannot exceed order total")
+	}
+
+	totalRefunded := refundedAmount + amount
+	status := "REFUND_PARTIALLY_COMPLETED"
+	orderPaymentStatus := "REFUND_PARTIALLY_COMPLETED"
+	if totalRefunded == grandTotal {
+		status = "REFUNDED"
+		orderPaymentStatus = "REFUNDED"
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
+		UPDATE ecom_returns
+		SET status = $2, refunded_amount = $3, refund_reference = $4,
+		    refunded_at = $5, refund_note = $6, updated_at = NOW()
+		WHERE id = $1
+	`, returnID, status, totalRefunded, reference, refundedAt, note); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		UPDATE ecom_orders
+		SET payment_status = $2, status = CASE WHEN $2 = 'REFUNDED' THEN 'RETURNED' ELSE status END,
+		    refunded_amount = $3, refund_reference = $4, refunded_at = $5,
+		    refund_note = $6, updated_at = NOW()
+		WHERE id = $1
+	`, orderID, orderPaymentStatus, totalRefunded, reference, refundedAt, note); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // MarkPayoutInitiated sets status to PAYOUT_INITIATED and records the transfer ID.

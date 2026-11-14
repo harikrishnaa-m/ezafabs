@@ -237,7 +237,6 @@ func main() {
 
 	ecomReturnStore := ecomReturn.NewStore(database)
 	ecomReturnHandler := ecomReturn.NewHandler(ecomReturnStore)
-	ecomPaymentHandler.SetReturnStore(ecomReturnStore)
 
 	migrationStore := migration.NewStore(database)
 	migrationHandler := migration.NewHandler(migrationStore)
@@ -314,7 +313,6 @@ func main() {
 	// Public webhooks — must be registered BEFORE ecomProtected is created
 	// so Fiber's ecom JWT middleware does not intercept them.
 	ecom.Post("/payments/webhook", ecomPaymentHandler.Webhook)
-	ecom.Post("/payouts/webhook", ecomPaymentHandler.PayoutWebhook)
 
 	// E-COMMERCE PROTECTED ROUTES (before ERP protected group)
 	ecomProtected := ecom.Group("", ecomMw.EcomJWTProtected(database))

@@ -1,9 +1,9 @@
 package order
 
 import (
-	"fmt"
 	"math"
 	"strings"
+	"time"
 
 	ecomMw "defab-erp/internal/ecom/middleware"
 	ecomPayment "defab-erp/internal/ecom/payment"
@@ -94,24 +94,26 @@ func (h *Handler) CancelOrder(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	// If paid online, initiate refund via Cashfree
+	// Paid orders are refunded manually by an administrator.
 	if result.PaymentMethod == "ONLINE" && result.PaymentStatus == "PAID" {
-		refundID := fmt.Sprintf("REF-%s", result.OrderNumber)
-		if err := ecomPayment.InitiateRefund(result.OrderNumber, refundID, result.GrandTotal); err != nil {
-			// Cancellation already done — return success but flag refund failure
-			return c.JSON(fiber.Map{
-				"message":       "order cancelled",
-				"refund_status": "failed",
-				"refund_error":  err.Error(),
-			})
+		if err := h.store.MarkRefundNotInitiated(result.OrderNumber); err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "order cancelled but refund status update failed"})
 		}
-		// Mark payment status as refund initiated
-		_ = h.store.MarkRefundInitiated(result.OrderNumber)
 		return c.JSON(fiber.Map{
 			"message":       "order cancelled",
-			"refund_status": "initiated",
+			"refund_status": "REFUND_NOT_INITIATED",
 			"refund_amount": result.GrandTotal,
 		})
+	}
+
+	if result.PaymentMethod == "ONLINE" && result.CoFeeOrderID != "" && result.PaymentStatus != "PAID" {
+		if err := ecomPayment.DisableCoFeeOrder(result.CoFeeOrderID); err != nil {
+			return c.JSON(fiber.Map{
+				"message":        "order cancelled",
+				"payment_status": "gateway cancellation pending",
+				"gateway_error":  err.Error(),
+			})
+		}
 	}
 
 	return c.JSON(fiber.Map{"message": "order cancelled"})
@@ -202,7 +204,11 @@ func (h *Handler) AdminUpdatePayment(c *fiber.Ctx) error {
 	}
 	in.PaymentStatus = strings.ToUpper(in.PaymentStatus)
 
-	valid := map[string]bool{"UNPAID": true, "PAID": true, "REFUNDED": true}
+	valid := map[string]bool{
+		"UNPAID": true, "PAID": true,
+		"REFUND_NOT_INITIATED": true, "REFUND_PARTIALLY_COMPLETED": true,
+		"REFUNDED": true,
+	}
 	if !valid[in.PaymentStatus] {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid payment_status"})
 	}
@@ -211,4 +217,29 @@ func (h *Handler) AdminUpdatePayment(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
 	}
 	return c.JSON(fiber.Map{"message": "payment updated"})
+}
+
+// PATCH /ecom/admin/orders/:id/refund
+func (h *Handler) AdminCompleteRefund(c *fiber.Ctx) error {
+	orderID := c.Params("id")
+	var in struct {
+		Amount     float64    `json:"refunded_amount"`
+		Reference  string     `json:"refund_reference"`
+		RefundedAt *time.Time `json:"refunded_at"`
+		Note       string     `json:"note"`
+	}
+	if err := c.BodyParser(&in); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid JSON"})
+	}
+	if in.Amount <= 0 || in.Reference == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "refunded_amount and refund_reference are required"})
+	}
+	refundedAt := time.Now()
+	if in.RefundedAt != nil {
+		refundedAt = *in.RefundedAt
+	}
+	if err := h.store.AdminCompleteRefund(orderID, in.Amount, in.Reference, refundedAt, in.Note); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"message": "refund marked completed"})
 }

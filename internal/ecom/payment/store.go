@@ -2,6 +2,7 @@ package payment
 
 import (
 	"database/sql"
+	"fmt"
 )
 
 type Store struct {
@@ -10,6 +11,35 @@ type Store struct {
 
 func NewStore(db *sql.DB) *Store {
 	return &Store{db: db}
+}
+
+func (s *Store) SaveCoFeeOrder(orderID, cofeeOrderID, paymentLink string) error {
+	_, err := s.db.Exec(`
+		UPDATE ecom_orders
+		SET cofee_order_id = $2, cofee_payment_link = $3, updated_at = NOW()
+		WHERE id = $1
+	`, orderID, cofeeOrderID, paymentLink)
+	return err
+}
+
+func (s *Store) GetCentralCoFeeBranchID() (string, error) {
+	var branchID sql.NullString
+	err := s.db.QueryRow(`
+		SELECT b.cofee_branch_id
+		FROM warehouses w
+		JOIN branches b ON b.id = w.branch_id
+		WHERE w.type = 'CENTRAL'
+		  AND NULLIF(b.cofee_branch_id, '') IS NOT NULL
+		ORDER BY w.id
+		LIMIT 1
+	`).Scan(&branchID)
+	if err == sql.ErrNoRows || !branchID.Valid {
+		return "", fmt.Errorf("cofee branch is not configured for the central warehouse")
+	}
+	if err != nil {
+		return "", err
+	}
+	return branchID.String, nil
 }
 
 // SaveCashfreeOrder saves the cf_order_id and payment_session_id to an existing order.
@@ -30,6 +60,15 @@ func (s *Store) MarkOrderPaid(orderNumber, paymentRef string) error {
 		SET payment_status = 'PAID', payment_ref = $2, updated_at = NOW()
 		WHERE order_number = $1
 	`, orderNumber, paymentRef)
+	return err
+}
+
+func (s *Store) MarkOrderPaidByCoFeeOrderID(orderID, paymentRef string) error {
+	_, err := s.db.Exec(`
+		UPDATE ecom_orders
+		SET payment_status = 'PAID', payment_ref = $2, updated_at = NOW()
+		WHERE cofee_order_id = $1
+	`, orderID, paymentRef)
 	return err
 }
 
@@ -69,6 +108,15 @@ func (s *Store) MarkRefundInitiated(orderNumber string) error {
 		UPDATE ecom_orders
 		SET payment_status = 'REFUND_INITIATED', updated_at = NOW()
 		WHERE order_number = $1
+	`, orderNumber)
+	return err
+}
+
+func (s *Store) MarkRefundNotInitiated(orderNumber string) error {
+	_, err := s.db.Exec(`
+		UPDATE ecom_orders
+		SET payment_status = 'REFUND_NOT_INITIATED', updated_at = NOW()
+		WHERE order_number = $1 AND payment_status = 'PAID'
 	`, orderNumber)
 	return err
 }

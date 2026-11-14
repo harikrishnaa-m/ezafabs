@@ -14,4 +14,5 @@ func RegisterAdminRoutes(adminGroup fiber.Router, h *Handler) {
 	adminGroup.Get("", h.AdminListReturns)
 	adminGroup.Patch("/:id/approve", h.AdminApproveReturn)
 	adminGroup.Patch("/:id/reject", h.AdminRejectReturn)
+	adminGroup.Patch("/:id/refund", h.AdminCompleteRefund)
 }

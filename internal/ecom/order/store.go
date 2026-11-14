@@ -412,6 +412,7 @@ func (s *Store) fetchOrderItems(orderID string) ([]map[string]interface{}, error
 // CancelOrderResult holds the details returned after a successful cancellation.
 type CancelOrderResult struct {
 	OrderNumber   string
+	CoFeeOrderID  string
 	PaymentMethod string
 	PaymentStatus string
 	GrandTotal    float64
@@ -427,9 +428,10 @@ func (s *Store) CancelOrder(customerID, orderID string) (*CancelOrderResult, err
 		WHERE id = $1
 		  AND customer_id = $2
 		  AND status NOT IN ('DELIVERED', 'RETURNED', 'CANCELLED')
-		RETURNING order_number, payment_method, payment_status, grand_total
+		RETURNING order_number, COALESCE(cofee_order_id, ''), payment_method, payment_status, grand_total
 	`, orderID, customerID).Scan(
 		&result.OrderNumber,
+		&result.CoFeeOrderID,
 		&result.PaymentMethod,
 		&result.PaymentStatus,
 		&result.GrandTotal,
@@ -445,6 +447,14 @@ func (s *Store) MarkRefundInitiated(orderNumber string) error {
 	_, err := s.db.Exec(`
 		UPDATE ecom_orders SET payment_status = 'REFUND_INITIATED', updated_at = NOW()
 		WHERE order_number = $1
+	`, orderNumber)
+	return err
+}
+
+func (s *Store) MarkRefundNotInitiated(orderNumber string) error {
+	_, err := s.db.Exec(`
+		UPDATE ecom_orders SET payment_status = 'REFUND_NOT_INITIATED', updated_at = NOW()
+		WHERE order_number = $1 AND payment_status = 'PAID'
 	`, orderNumber)
 	return err
 }
@@ -580,6 +590,41 @@ func (s *Store) AdminUpdatePayment(orderID, payStatus, payRef string) error {
 		return fmt.Errorf("order not found")
 	}
 	return nil
+}
+
+func (s *Store) AdminCompleteRefund(orderID string, amount float64, reference string, refundedAt time.Time, note string) error {
+	var paymentStatus string
+	var grandTotal, refundedAmount float64
+	err := s.db.QueryRow(`
+		SELECT payment_status, grand_total, refunded_amount
+		FROM ecom_orders WHERE id = $1
+	`, orderID).Scan(&paymentStatus, &grandTotal, &refundedAmount)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("order not found")
+	}
+	if err != nil {
+		return err
+	}
+	if paymentStatus != "REFUND_NOT_INITIATED" && paymentStatus != "REFUND_PARTIALLY_COMPLETED" {
+		return fmt.Errorf("order is not awaiting a manual refund")
+	}
+	if refundedAmount+amount > grandTotal {
+		return fmt.Errorf("refunded amount cannot exceed order total")
+	}
+
+	totalRefunded := refundedAmount + amount
+	status := "REFUND_PARTIALLY_COMPLETED"
+	if totalRefunded == grandTotal {
+		status = "REFUNDED"
+	}
+	_, err = s.db.Exec(`
+		UPDATE ecom_orders
+		SET payment_status = $2, refunded_amount = $3,
+		    refund_reference = $4, refunded_at = $5, refund_note = $6,
+		    updated_at = NOW()
+		WHERE id = $1
+	`, orderID, status, totalRefunded, reference, refundedAt, note)
+	return err
 }
 
 // AdminGetOrder returns full order details without customer_id check (for admins).
