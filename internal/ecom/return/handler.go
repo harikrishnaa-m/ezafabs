@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	ecomMw "defab-erp/internal/ecom/middleware"
-	ecomPayment "defab-erp/internal/ecom/payment"
 
 	"github.com/gofiber/fiber/v2"
 )
@@ -120,7 +120,7 @@ func (h *Handler) AdminListReturns(c *fiber.Ctx) error {
 }
 
 // PATCH /admin/ecom-returns/:id/approve
-// Approves the return and triggers refund (ONLINE) or payout (COD).
+// Approves the return and queues a manual refund.
 func (h *Handler) AdminApproveReturn(c *fiber.Ctx) error {
 	returnID := c.Params("id")
 
@@ -140,52 +140,11 @@ func (h *Handler) AdminApproveReturn(c *fiber.Ctx) error {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	// Trigger refund or payout based on payment method
-	if info.PaymentMethod == "ONLINE" && info.PaymentStatus == "PAID" {
-		refundID := "RETURN-" + info.OrderNumber
-		if err := ecomPayment.InitiateRefund(info.OrderNumber, refundID, info.GrandTotal); err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": "approved but refund initiation failed: " + err.Error()})
-		}
-		if err := h.store.MarkRefundInitiated(returnID, info.OrderNumber); err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": "refund initiated but status update failed"})
-		}
-		return c.JSON(fiber.Map{"message": "return approved and refund initiated"})
+	if err := h.store.MarkRefundNotInitiated(returnID, info.OrderNumber); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "return approved but refund status update failed"})
 	}
 
-	if info.PaymentMethod == "COD" {
-		if ret.PayoutMethod == nil {
-			return c.Status(400).JSON(fiber.Map{"error": "no payout method on file for this return"})
-		}
-		transferID := "POUT-" + info.OrderNumber
-		bene := ecomPayment.PayoutBeneficiary{
-			Name:  "Customer",
-			Email: "noreply@defab.in",
-			Phone: "9999999999",
-		}
-		if *ret.PayoutMethod == "UPI" && ret.PayoutUPI != nil {
-			bene.BeneficiaryID = "CUST-" + info.CustomerID + "-UPI"
-			bene.VPA = *ret.PayoutUPI
-		} else if ret.PayoutAccountNumber != nil && ret.PayoutIFSC != nil {
-			bene.BeneficiaryID = "CUST-" + info.CustomerID + "-BANK"
-			bene.BankAccount = *ret.PayoutAccountNumber
-			bene.IFSC = *ret.PayoutIFSC
-			if ret.PayoutAccountName != nil {
-				bene.Name = *ret.PayoutAccountName
-			}
-		} else {
-			return c.Status(400).JSON(fiber.Map{"error": "incomplete payout details on file"})
-		}
-
-		if err := ecomPayment.InitiatePayout(transferID, info.GrandTotal, bene); err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": "approved but payout initiation failed: " + err.Error()})
-		}
-		if err := h.store.MarkPayoutInitiated(returnID, transferID, info.OrderNumber); err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": "payout initiated but status update failed"})
-		}
-		return c.JSON(fiber.Map{"message": "return approved and payout initiated"})
-	}
-
-	return c.JSON(fiber.Map{"message": "return approved"})
+	return c.JSON(fiber.Map{"message": "return approved", "refund_status": "REFUND_NOT_INITIATED"})
 }
 
 // PATCH /admin/ecom-returns/:id/reject
@@ -200,4 +159,29 @@ func (h *Handler) AdminRejectReturn(c *fiber.Ctx) error {
 		return c.Status(500).JSON(fiber.Map{"error": msg})
 	}
 	return c.JSON(fiber.Map{"message": "return rejected"})
+}
+
+// PATCH /admin/ecom-returns/:id/refund
+func (h *Handler) AdminCompleteRefund(c *fiber.Ctx) error {
+	returnID := c.Params("id")
+	var in struct {
+		Amount     float64    `json:"refunded_amount"`
+		Reference  string     `json:"refund_reference"`
+		RefundedAt *time.Time `json:"refunded_at"`
+		Note       string     `json:"note"`
+	}
+	if err := c.BodyParser(&in); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid JSON"})
+	}
+	if in.Amount <= 0 || in.Reference == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "refunded_amount and refund_reference are required"})
+	}
+	refundedAt := time.Now()
+	if in.RefundedAt != nil {
+		refundedAt = *in.RefundedAt
+	}
+	if err := h.store.AdminCompleteRefund(returnID, in.Amount, in.Reference, refundedAt, in.Note); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"message": "refund marked completed"})
 }
