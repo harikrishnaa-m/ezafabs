@@ -27,6 +27,7 @@ import (
 
 	"defab-erp/internal/attribute"
 	"defab-erp/internal/category"
+	"defab-erp/internal/contactinquiry"
 	"defab-erp/internal/product"
 
 	"defab-erp/internal/productdescription"
@@ -126,6 +127,9 @@ func main() {
 
 	categoryStore := category.NewStore(database)
 	categoryHandler := category.NewHandler(categoryStore)
+
+	contactInquiryStore := contactinquiry.NewStore(database)
+	contactInquiryHandler := contactinquiry.NewHandler(contactInquiryStore)
 
 	productStore := product.NewStore(database)
 	productHandler := product.NewHandler(productStore)
@@ -314,6 +318,8 @@ func main() {
 	// so Fiber's ecom JWT middleware does not intercept them.
 	ecom.Post("/payments/webhook", ecomPaymentHandler.Webhook)
 
+	contactinquiry.RegisterPublicRoutes(api.Group("/contact-inquiries"), contactInquiryHandler)
+
 	// E-COMMERCE PROTECTED ROUTES (before ERP protected group)
 	ecomProtected := ecom.Group("", ecomMw.EcomJWTProtected(database))
 	ecomCustomer.RegisterProtectedRoutes(ecomProtected, ecomCustomerHandler)
@@ -402,6 +408,17 @@ func main() {
 			),
 		),
 		categoryHandler,
+	)
+
+	contactinquiry.RegisterAdminRoutes(
+		protected.Group("/contact-inquiries",
+			middleware.RequireRole(
+				model.RoleSuperAdmin,
+				model.RoleStoreManager,
+				model.RoleAccountsManager,
+			),
+		),
+		contactInquiryHandler,
 	)
 
 	product.RegisterRoutes(

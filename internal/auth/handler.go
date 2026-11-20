@@ -2,8 +2,10 @@ package auth
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"defab-erp/internal/core/model"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log"
 	"net/smtp"
@@ -75,12 +77,25 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 	// find user
 	u, err := h.store.GetUserByEmail(input.Email)
 	if err != nil {
-		return c.Status(401).SendString("invalid credentials")
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.Status(401).JSON(fiber.Map{
+				"error":   "INVALID_CREDENTIALS",
+				"message": "Invalid email or password.",
+			})
+		}
+		log.Println("login user lookup error:", err)
+		return c.Status(500).JSON(fiber.Map{
+			"error":   "INTERNAL_ERROR",
+			"message": "Unable to process login.",
+		})
 	}
 
 	// check password
 	if !CheckPassword(u.PasswordHash, input.Password) {
-		return c.Status(401).SendString("invalid credentials")
+		return c.Status(401).JSON(fiber.Map{
+			"error":   "INVALID_CREDENTIALS",
+			"message": "Invalid email or password.",
+		})
 	}
 
 	// generate access token

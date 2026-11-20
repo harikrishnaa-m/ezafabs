@@ -179,7 +179,7 @@ func (s *Store) GetUserByEmail(email string) (*model.User, error) {
 
 	fmt.Println("[DEBUG] Query error:", err)
 	if err == sql.ErrNoRows {
-		return nil, errors.New("user not found")
+		return nil, sql.ErrNoRows
 	}
 	if err != nil {
 		return nil, err

@@ -55,6 +55,9 @@ func (h *Handler) Create(c *fiber.Ctx) error {
 		if !allowed[in.PaymentMethod] {
 			return httperr.BadRequest(c, "payment_method must be CASH, UPI, CARD, or BANK_TRANSFER")
 		}
+		if in.PaymentMethod != "CASH" && strings.TrimSpace(in.Reference) == "" {
+			return httperr.BadRequest(c, "reference is required for non-cash payments")
+		}
 	}
 
 	user := c.Locals("user").(*model.User)
@@ -129,6 +132,9 @@ func (h *Handler) RecordPayment(c *fiber.Ctx) error {
 		return httperr.BadRequest(c, "payment_method must be CASH, UPI, CARD, or BANK_TRANSFER")
 	}
 	in.PaymentMethod = strings.ToUpper(in.PaymentMethod)
+	if in.PaymentMethod != "CASH" && strings.TrimSpace(in.Reference) == "" {
+		return httperr.BadRequest(c, "reference is required for non-cash payments")
+	}
 
 	if err := h.store.RecordPayment(id, in); err != nil {
 		if strings.Contains(err.Error(), "exceeds balance") || strings.Contains(err.Error(), "cancelled") {

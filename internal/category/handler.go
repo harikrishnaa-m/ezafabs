@@ -1,6 +1,13 @@
 package category
 
-import "github.com/gofiber/fiber/v2"
+import (
+	"errors"
+
+	"defab-erp/internal/core/httperr"
+
+	"github.com/gofiber/fiber/v2"
+	"github.com/jackc/pgx/v5/pgconn"
+)
 
 type Handler struct {
 	store *Store
@@ -26,6 +33,9 @@ func (h *Handler) Create(c *fiber.Ctx) error {
 	}
 
 	if err := h.store.Create(in); err != nil {
+		if isUniqueViolation(err) {
+			return httperr.Conflict(c, "Category already exists.")
+		}
 		return c.Status(500).SendString(err.Error())
 	}
 
@@ -203,10 +213,18 @@ func (h *Handler) Update(c *fiber.Ctx) error {
 	}
 
 	if err := h.store.Update(id, in); err != nil {
+		if isUniqueViolation(err) {
+			return httperr.Conflict(c, "Category already exists.")
+		}
 		return c.Status(500).SendString(err.Error())
 	}
 
 	return c.SendStatus(200)
+}
+
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
 //
