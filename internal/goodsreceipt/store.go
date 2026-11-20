@@ -184,7 +184,8 @@ func (s *Store) GetByID(id string) (*GoodsReceiptResponse, error) {
 		       gr.supplier_id, s.name AS supplier_name,
 		       gr.warehouse_id, w.name AS warehouse_name,
 		       gr.received_by, u.name AS received_by_name,
-		       gr.received_date::text, gr.reference, gr.status, gr.created_at::text
+		       (gr.received_date AT TIME ZONE 'Asia/Kolkata')::date::text,
+		       gr.reference, gr.status, gr.created_at::text
 		FROM goods_receipts gr
 		JOIN purchase_orders po ON po.id = gr.purchase_order_id
 		JOIN suppliers s ON s.id = gr.supplier_id
@@ -234,7 +235,8 @@ func (s *Store) ListByPO(poID string) ([]GoodsReceiptResponse, error) {
 		       gr.supplier_id, s.name AS supplier_name,
 		       gr.warehouse_id, w.name AS warehouse_name,
 		       gr.received_by, u.name AS received_by_name,
-		       gr.received_date::text, gr.reference, gr.status, gr.created_at::text
+		       (gr.received_date AT TIME ZONE 'Asia/Kolkata')::date::text,
+		       gr.reference, gr.status, gr.created_at::text
 		FROM goods_receipts gr
 		JOIN purchase_orders po ON po.id = gr.purchase_order_id
 		JOIN suppliers s ON s.id = gr.supplier_id
@@ -276,7 +278,8 @@ func (s *Store) List() ([]GoodsReceiptResponse, error) {
 		       gr.supplier_id, s.name AS supplier_name,
 		       gr.warehouse_id, w.name AS warehouse_name,
 		       gr.received_by, u.name AS received_by_name,
-		       gr.received_date::text, gr.reference, gr.status, gr.created_at::text
+		       (gr.received_date AT TIME ZONE 'Asia/Kolkata')::date::text,
+		       gr.reference, gr.status, gr.created_at::text
 		FROM goods_receipts gr
 		JOIN purchase_orders po ON po.id = gr.purchase_order_id
 		JOIN suppliers s ON s.id = gr.supplier_id

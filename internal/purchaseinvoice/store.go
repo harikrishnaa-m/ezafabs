@@ -364,7 +364,17 @@ func (s *Store) RecordPayment(invoiceID string, in RecordPaymentInput) error {
 	// Fetch current amounts
 	var netAmount, paidAmount float64
 	var status string
-	err = tx.QueryRow(`SELECT net_amount, paid_amount, status FROM purchase_invoices WHERE id = $1`, invoiceID).Scan(&netAmount, &paidAmount, &status)
+	err = tx.QueryRow(`
+		SELECT pi.net_amount, pi.status,
+		       COALESCE((
+			       SELECT SUM(sp.amount)
+			       FROM supplier_payments sp
+			       WHERE sp.purchase_invoice_id = pi.id
+		       ), 0)
+		FROM purchase_invoices pi
+		WHERE pi.id = $1
+		FOR UPDATE
+	`, invoiceID).Scan(&netAmount, &status, &paidAmount)
 	if err != nil {
 		return fmt.Errorf("invoice not found: %w", err)
 	}
@@ -402,9 +412,14 @@ func (s *Store) RecordPayment(invoiceID string, in RecordPaymentInput) error {
 
 	_, err = tx.Exec(`
 		UPDATE purchase_invoices
-		SET paid_amount = $1, status = $2
-		WHERE id = $3
-	`, newPaid, newStatus, invoiceID)
+		SET paid_amount = (
+			SELECT COALESCE(SUM(amount), 0)
+			FROM supplier_payments
+			WHERE purchase_invoice_id = $1
+		),
+		    status = $2
+		WHERE id = $1
+	`, invoiceID, newStatus)
 	if err != nil {
 		return fmt.Errorf("update invoice: %w", err)
 	}

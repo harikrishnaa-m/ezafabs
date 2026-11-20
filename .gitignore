@@ -81,5 +81,11 @@ coverage.html
 # Docker (if later added)
 # ========================
 docker-data/
+
+# ========================
+# Local Postman collections (may contain credentials)
+# ========================
+postman/
+
 login.html
 cashfree_test.html
